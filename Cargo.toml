@@ -1,0 +1,26 @@
+[package]
+name = "vaulet_core"
+version = "0.1.0"
+edition = "2021"
+description = "Vaulet identity core: keys, DIDs, credentials, OID4VC protocol (PLAN.md D5)"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+p256 = { version = "0.13", features = ["ecdsa", "jwk"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+# แผนการเพิ่ม dependency (ดู PLAN.md D5) — เพิ่มเมื่อเริ่ม implement จริง:
+# ssi = "0.12"                  # W3C VC, SD-JWT, did:key/jwk/web (SpruceID)
+# didcomm = "0.4"               # DIDComm v2 (เฟส M2)
+# p256 = "0.13"                 # ES256 — ตรงกับ Secure Enclave
+# flutter_rust_bridge = "2"     # FFI bridge ไป Flutter
+# vsss-rs = "5"                 # Shamir secret sharing (เฟส M3)
