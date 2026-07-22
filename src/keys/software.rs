@@ -7,7 +7,7 @@
 
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
-use p256::SecretKey;
+use p256::{FieldBytes, SecretKey};
 use serde_json::Value;
 
 use crate::{CoreError, Result};
@@ -41,6 +41,23 @@ impl SoftwareKey {
         let jwk = self.secret.public_key().to_jwk_string();
         serde_json::from_str(&jwk)
             .map_err(|e| CoreError::Key(format!("public jwk parse: {e}")))
+    }
+
+    /// Raw 32-byte private scalar (the P-256 `d` value, big-endian).
+    /// This is the entropy the BIP39 recovery phrase encodes (ADR 0001).
+    pub fn to_scalar_bytes(&self) -> [u8; 32] {
+        let fb = self.secret.to_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&fb);
+        out
+    }
+
+    /// Rebuild a key from a raw 32-byte scalar. Errors if the scalar is out of
+    /// range for P-256 (i.e. not in [1, n-1]).
+    pub fn from_scalar_bytes(b: &[u8; 32]) -> Result<Self> {
+        let secret = SecretKey::from_bytes(FieldBytes::from_slice(b))
+            .map_err(|e| CoreError::Key(format!("scalar out of range: {e}")))?;
+        Ok(Self { secret })
     }
 
     /// Sign with ES256 (ECDSA P-256 + SHA-256).

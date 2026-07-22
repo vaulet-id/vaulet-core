@@ -1,0 +1,143 @@
+//! Recovery-file encryption (PLAN.md D3, M1 "simple backup first").
+//!
+//! Encrypts the private-key JWK with a user passphrase so it can be exported to
+//! a file (iCloud Drive / Files) and restored on another device. Non-custodial:
+//! the passphrase never leaves the device and we never see the key — losing the
+//! passphrase means the backup is unrecoverable.
+//!
+//! Scheme: Argon2id(passphrase, salt) -> 32-byte key -> XChaCha20-Poly1305 seal.
+//! The M3 Shamir path (2-of-3) will split this same JWK instead of encrypting it.
+
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use rand_core::RngCore;
+use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
+
+use crate::{CoreError, Result};
+
+// Argon2id parameters — kept in the envelope so a future decrypt can reproduce
+// the derivation even if these defaults change.
+const KDF_MEM_KIB: u32 = 19_456; // 19 MiB
+const KDF_ITERS: u32 = 2;
+const KDF_LANES: u32 = 1;
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 24; // XChaCha20 nonce
+const KEY_LEN: usize = 32;
+
+/// On-disk recovery-file envelope. Everything but the plaintext key.
+#[derive(Serialize, Deserialize)]
+struct Envelope {
+    v: u8,
+    kdf: String,
+    m: u32,
+    t: u32,
+    p: u32,
+    salt: String,  // base64
+    nonce: String, // base64
+    ct: String,    // base64 (ciphertext + AEAD tag)
+}
+
+/// Derive the AEAD key from the passphrase and salt with Argon2id.
+fn derive_key(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; KEY_LEN]> {
+    let params = Params::new(m, t, p, Some(KEY_LEN))
+        .map_err(|e| CoreError::Key(format!("argon2 params: {e}")))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; KEY_LEN];
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| CoreError::Key(format!("argon2 derive: {e}")))?;
+    Ok(key)
+}
+
+/// Encrypt a JWK string into a recovery-file envelope (compact JSON).
+pub fn encrypt_backup(jwk: &str, passphrase: &str) -> Result<String> {
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    rand_core::OsRng.fill_bytes(&mut salt);
+    rand_core::OsRng.fill_bytes(&mut nonce);
+
+    let mut key = derive_key(passphrase, &salt, KDF_MEM_KIB, KDF_ITERS, KDF_LANES)?;
+    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
+    key.zeroize();
+
+    let ct = cipher
+        .encrypt(XNonce::from_slice(&nonce), jwk.as_bytes())
+        .map_err(|e| CoreError::Key(format!("encrypt backup: {e}")))?;
+
+    let envelope = Envelope {
+        v: 1,
+        kdf: "argon2id".to_string(),
+        m: KDF_MEM_KIB,
+        t: KDF_ITERS,
+        p: KDF_LANES,
+        salt: STANDARD.encode(salt),
+        nonce: STANDARD.encode(nonce),
+        ct: STANDARD.encode(ct),
+    };
+    serde_json::to_string(&envelope)
+        .map_err(|e| CoreError::Key(format!("serialize envelope: {e}")))
+}
+
+/// Decrypt a recovery-file envelope back into the JWK string.
+/// A wrong passphrase or tampered file fails the AEAD check here.
+pub fn decrypt_backup(envelope: &str, passphrase: &str) -> Result<String> {
+    let env: Envelope = serde_json::from_str(envelope)
+        .map_err(|e| CoreError::Key(format!("parse backup file: {e}")))?;
+    if env.v != 1 {
+        return Err(CoreError::Key(format!("unsupported backup version: {}", env.v)));
+    }
+
+    let salt = STANDARD
+        .decode(&env.salt)
+        .map_err(|e| CoreError::Key(format!("bad salt: {e}")))?;
+    let nonce = STANDARD
+        .decode(&env.nonce)
+        .map_err(|e| CoreError::Key(format!("bad nonce: {e}")))?;
+    let ct = STANDARD
+        .decode(&env.ct)
+        .map_err(|e| CoreError::Key(format!("bad ciphertext: {e}")))?;
+    if nonce.len() != NONCE_LEN {
+        return Err(CoreError::Key("bad nonce length".into()));
+    }
+
+    let mut key = derive_key(passphrase, &salt, env.m, env.t, env.p)?;
+    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
+    key.zeroize();
+
+    let mut pt = cipher
+        .decrypt(XNonce::from_slice(&nonce), ct.as_ref())
+        .map_err(|_| CoreError::Key("wrong passphrase or corrupt backup file".into()))?;
+    let jwk = String::from_utf8(pt.clone())
+        .map_err(|e| CoreError::Key(format!("decrypted backup not utf8: {e}")))?;
+    pt.zeroize();
+    Ok(jwk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trips() {
+        let jwk = r#"{"kty":"EC","crv":"P-256","x":"aaa","y":"bbb","d":"ccc"}"#;
+        let env = encrypt_backup(jwk, "correct horse").unwrap();
+        assert_eq!(decrypt_backup(&env, "correct horse").unwrap(), jwk);
+    }
+
+    #[test]
+    fn wrong_passphrase_fails() {
+        let env = encrypt_backup("secret-jwk", "right").unwrap();
+        assert!(decrypt_backup(&env, "wrong").is_err());
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails() {
+        let env = encrypt_backup("secret-jwk", "pw").unwrap();
+        let corrupt = env.replace("\"ct\":\"", "\"ct\":\"A");
+        assert!(decrypt_backup(&corrupt, "pw").is_err());
+    }
+}

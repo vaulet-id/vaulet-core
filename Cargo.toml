@@ -14,13 +14,28 @@ thiserror = "2"
 p256 = { version = "0.13", features = ["ecdsa", "jwk"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
+# Recovery-file encryption (M1 backup — PLAN.md D3).
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1"
+# Recovery-phrase (BIP39) encoding of the P-256 scalar (ADR 0001, approach A).
+bip39 = "2"
+# Shamir recovery (ADR 0002): split the 32-byte scalar over GF(256).
+sharks = "0.5"
+sha2 = "0.10"
+# SD-JWT VC + KB-JWT mechanics (ADR 0004). SoftwareKey is the external ES256
+# JwsSigner, so this crate never owns key material.
+sd-jwt-payload = "0.5.1"
+# Required to implement sd-jwt-payload's async JwsSigner trait.
+async-trait = "0.1"
+# Minimal executor to drive the (immediately-resolving) async signer from our
+# sync FFI-facing functions. No real await points, so no runtime is needed.
+pollster = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
 
-# แผนการเพิ่ม dependency (ดู PLAN.md D5) — เพิ่มเมื่อเริ่ม implement จริง:
-# ssi = "0.12"                  # W3C VC, SD-JWT, did:key/jwk/web (SpruceID)
-# didcomm = "0.4"               # DIDComm v2 (เฟส M2)
-# p256 = "0.13"                 # ES256 — ตรงกับ Secure Enclave
-# flutter_rust_bridge = "2"     # FFI bridge ไป Flutter
-# vsss-rs = "5"                 # Shamir secret sharing (เฟส M3)
+# Planned dependencies (see PLAN.md D5) — add when implementation starts:
+# ssi = "0.12"                  # W3C VC, SD-JWT, did:key/jwk/web (SpruceID)  — NOT adopted, see ADR 0004
+# didcomm = "0.4"               # DIDComm v2 (phase M2)
+# vsss-rs = "5"                 # Shamir secret sharing (phase M3)
