@@ -27,6 +27,12 @@ use crate::{CoreError, Result};
 const KDF_MEM_KIB: u32 = 65_536; // 64 MiB
 const KDF_ITERS: u32 = 3;
 const KDF_LANES: u32 = 1;
+// PIN seal (app unlock): the sealed seed already sits behind the Secure Enclave
+// (ThisDeviceOnly) + a failed-attempt backoff, so the KDF is a defence-in-depth
+// layer, not the sole barrier. Lighter params (OWASP interactive minimum) keep
+// every unlock snappy instead of the ~1s a 64 MiB derive costs.
+const PIN_KDF_MEM_KIB: u32 = 19_456; // 19 MiB
+const PIN_KDF_ITERS: u32 = 2;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24; // XChaCha20 nonce
 const KEY_LEN: usize = 32;
@@ -56,26 +62,27 @@ fn derive_key(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[
     Ok(key)
 }
 
-/// Encrypt a JWK string into a recovery-file envelope (compact JSON).
-pub fn encrypt_backup(jwk: &str, passphrase: &str) -> Result<String> {
+/// Encrypt a secret into an envelope with the given Argon2id memory/iterations.
+/// The params are stored in the envelope, so `decrypt_backup` reproduces them.
+fn encrypt_with(secret: &str, passphrase: &str, m: u32, t: u32) -> Result<String> {
     let mut salt = [0u8; SALT_LEN];
     let mut nonce = [0u8; NONCE_LEN];
     rand_core::OsRng.fill_bytes(&mut salt);
     rand_core::OsRng.fill_bytes(&mut nonce);
 
-    let mut key = derive_key(passphrase, &salt, KDF_MEM_KIB, KDF_ITERS, KDF_LANES)?;
+    let mut key = derive_key(passphrase, &salt, m, t, KDF_LANES)?;
     let cipher = XChaCha20Poly1305::new(key.as_ref().into());
     key.zeroize();
 
     let ct = cipher
-        .encrypt(XNonce::from_slice(&nonce), jwk.as_bytes())
-        .map_err(|e| CoreError::Key(format!("encrypt backup: {e}")))?;
+        .encrypt(XNonce::from_slice(&nonce), secret.as_bytes())
+        .map_err(|e| CoreError::Key(format!("encrypt: {e}")))?;
 
     let envelope = Envelope {
         v: 1,
         kdf: "argon2id".to_string(),
-        m: KDF_MEM_KIB,
-        t: KDF_ITERS,
+        m,
+        t,
         p: KDF_LANES,
         salt: STANDARD.encode(salt),
         nonce: STANDARD.encode(nonce),
@@ -83,6 +90,18 @@ pub fn encrypt_backup(jwk: &str, passphrase: &str) -> Result<String> {
     };
     serde_json::to_string(&envelope)
         .map_err(|e| CoreError::Key(format!("serialize envelope: {e}")))
+}
+
+/// Encrypt a JWK/seed into a recovery-FILE envelope — strong params, because the
+/// file is offline-attackable (the user saves/shares it).
+pub fn encrypt_backup(jwk: &str, passphrase: &str) -> Result<String> {
+    encrypt_with(jwk, passphrase, KDF_MEM_KIB, KDF_ITERS)
+}
+
+/// Seal a seed under the app PIN — lighter params for fast unlock (see the
+/// PIN_KDF constants). Same envelope format, so [`decrypt_backup`] opens both.
+pub fn encrypt_pin(secret: &str, pin: &str) -> Result<String> {
+    encrypt_with(secret, pin, PIN_KDF_MEM_KIB, PIN_KDF_ITERS)
 }
 
 /// Decrypt a recovery-file envelope back into the JWK string.
