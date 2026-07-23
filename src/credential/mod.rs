@@ -16,6 +16,7 @@ use sd_jwt_payload::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::did::{signing_jwk_for_kid, DidResolver};
 use crate::keys::software::SoftwareKey;
@@ -360,9 +361,42 @@ pub fn ingest_with_did_document(
     did_doc: &Value,
     now: i64,
     hints: DisplayHints,
+    pinned: &[String],
 ) -> Result<StoredCredential> {
-    let verified = verify_with_did_document(sd_jwt, did_doc, now)?;
+    let issuer_jwk = issuer_jwk_from_did_doc(sd_jwt, did_doc)?;
+    // Issuer key pinning (SSI trust registry, ADR 0008 / SECURITY-REVIEW): when
+    // the caller pins expected key thumbprint(s) for this issuer, the key that
+    // actually verifies the credential must be one of them. This anchors trust
+    // in the DID's KEY, not the TLS transport — so a MITM/rogue-CA serving a
+    // fake did.json (even for a did:web issuer) is rejected. Empty = not pinned.
+    if !pinned.is_empty() {
+        let tp = jwk_thumbprint(&issuer_jwk)?;
+        if !pinned.iter().any(|p| p == &tp) {
+            return Err(CoreError::Credential(
+                "issuer signing key does not match the pinned key for this issuer".into(),
+            ));
+        }
+    }
+    let verified = verify(sd_jwt, &issuer_jwk, now)?;
     Ok(build_stored(id.into(), sd_jwt, &verified, hints))
+}
+
+/// RFC 7638 JWK thumbprint (SHA-256, base64url) for an EC public key — the
+/// stable key identifier the issuer trust registry pins. Only the required
+/// members (`crv`, `kty`, `x`, `y`) in lexicographic order, no whitespace.
+pub fn jwk_thumbprint(jwk: &Value) -> Result<String> {
+    let member = |k: &str| {
+        jwk.get(k)
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::Credential(format!("jwk missing {k} for thumbprint")))
+    };
+    let kty = member("kty")?;
+    if kty != "EC" {
+        return Err(CoreError::Credential("thumbprint supports EC keys only".into()));
+    }
+    let (crv, x, y) = (member("crv")?, member("x")?, member("y")?);
+    let canonical = format!(r#"{{"crv":"{crv}","kty":"{kty}","x":"{x}","y":"{y}"}}"#);
+    Ok(B64.encode(Sha256::digest(canonical.as_bytes())))
 }
 
 /// Assemble a [`StoredCredential`] from a verified view. Display falls back to a
@@ -706,6 +740,7 @@ mod tests {
             &doc,
             1_700_000_000,
             DisplayHints::default(),
+            &[],
         )
         .unwrap();
         assert_eq!(bare.id, "cred-1");
@@ -727,11 +762,48 @@ mod tests {
                 issuer_name: Some("Codefin Co., Ltd.".into()),
                 color: Some("#0E7C66".into()),
             },
+            &[],
         )
         .unwrap();
         assert_eq!(hinted.display.title, "Employee Badge");
         assert_eq!(hinted.display.issuer_name, "Codefin Co., Ltd.");
         assert_eq!(hinted.display.color.as_deref(), Some("#0E7C66"));
+    }
+
+    #[test]
+    fn ingest_enforces_pinned_issuer_key() {
+        let issuer = SoftwareKey::generate();
+        let holder = SoftwareKey::generate();
+        let sd_jwt = issue(sample_params(&holder), &issuer).unwrap();
+        let doc = did_doc_for(&issuer.public_jwk().unwrap());
+        let now = 1_700_000_000;
+        let tp = jwk_thumbprint(&issuer.public_jwk().unwrap()).unwrap();
+
+        // Correct pin → accepted.
+        assert!(ingest_with_did_document(
+            "c", &sd_jwt, &doc, now, DisplayHints::default(), &[tp.clone()]
+        )
+        .is_ok());
+        // Wrong pin → rejected even though the issuer signature is valid (this is
+        // the MITM/rogue-did.json defence).
+        assert!(ingest_with_did_document(
+            "c", &sd_jwt, &doc, now, DisplayHints::default(), &["not-the-key".to_string()]
+        )
+        .is_err());
+        // No pins → allowed (issuer not pinned in the registry).
+        assert!(ingest_with_did_document(
+            "c", &sd_jwt, &doc, now, DisplayHints::default(), &[]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn jwk_thumbprint_is_stable_and_key_specific() {
+        let a = SoftwareKey::generate();
+        let b = SoftwareKey::generate();
+        let ta = jwk_thumbprint(&a.public_jwk().unwrap()).unwrap();
+        assert_eq!(ta, jwk_thumbprint(&a.public_jwk().unwrap()).unwrap()); // stable
+        assert_ne!(ta, jwk_thumbprint(&b.public_jwk().unwrap()).unwrap()); // per-key
     }
 
     #[test]
@@ -742,7 +814,8 @@ mod tests {
         let doc = did_doc_for(&issuer.public_jwk().unwrap());
         let now = 1_700_000_000 + 366 * 24 * HOUR;
         assert!(
-            ingest_with_did_document("c", &sd_jwt, &doc, now, DisplayHints::default()).is_err()
+            ingest_with_did_document("c", &sd_jwt, &doc, now, DisplayHints::default(), &[])
+                .is_err()
         );
     }
 

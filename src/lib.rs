@@ -241,17 +241,21 @@ pub fn wallet_present(
 /// verify it against the issuer's `did:web` document (Dart fetched the doc, so
 /// this stays network-free) and cache its display. `issuer_did_doc` is the raw
 /// `did.json` body; `hints` come from the issuer's OID4VCI metadata; `now` is the
-/// caller's Unix clock. Rejects a bad signature or an expired credential.
+/// caller's Unix clock. `pinned` are the RFC 7638 thumbprints the trust registry
+/// pins for this issuer (empty = not pinned): when set, the verifying key must
+/// match one — anchoring trust in the issuer KEY, not the TLS transport. Rejects
+/// a bad signature, an expired credential, or an unpinned issuer key.
 pub fn wallet_ingest_credential(
     id: &str,
     sd_jwt: &str,
     issuer_did_doc: &str,
     now: i64,
     hints: credential::DisplayHints,
+    pinned: &[String],
 ) -> Result<credential::StoredCredential> {
     let doc: serde_json::Value = serde_json::from_str(issuer_did_doc)
         .map_err(|e| CoreError::Credential(format!("issuer did.json parse: {e}")))?;
-    credential::ingest_with_did_document(id, sd_jwt, &doc, now, hints)
+    credential::ingest_with_did_document(id, sd_jwt, &doc, now, hints, pinned)
 }
 
 #[cfg(test)]
