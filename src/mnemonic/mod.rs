@@ -8,6 +8,7 @@
 
 use bip39::Mnemonic;
 use rand_core::{OsRng, RngCore};
+use zeroize::Zeroize;
 
 use crate::{CoreError, Result};
 
@@ -18,6 +19,7 @@ pub fn generate() -> Result<String> {
     OsRng.fill_bytes(&mut entropy);
     let mnemonic = Mnemonic::from_entropy(&entropy)
         .map_err(|e| CoreError::Key(format!("mnemonic generate: {e}")))?;
+    entropy.zeroize(); // wipe the raw 256-bit entropy once the words are built
     Ok(mnemonic.to_string())
 }
 

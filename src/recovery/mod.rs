@@ -21,8 +21,11 @@ use crate::{CoreError, Result};
 
 // Argon2id parameters — kept in the envelope so a future decrypt can reproduce
 // the derivation even if these defaults change.
-const KDF_MEM_KIB: u32 = 19_456; // 19 MiB
-const KDF_ITERS: u32 = 2;
+// Hardened for an offline-attackable backup file protecting a root seed: well
+// above the OWASP Argon2id minimum (19 MiB / t=2). ~64 MiB / t=3 costs an
+// attacker far more per passphrase guess while staying ~sub-second on a phone.
+const KDF_MEM_KIB: u32 = 65_536; // 64 MiB
+const KDF_ITERS: u32 = 3;
 const KDF_LANES: u32 = 1;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24; // XChaCha20 nonce
@@ -108,13 +111,13 @@ pub fn decrypt_backup(envelope: &str, passphrase: &str) -> Result<String> {
     let cipher = XChaCha20Poly1305::new(key.as_ref().into());
     key.zeroize();
 
-    let mut pt = cipher
+    let pt = cipher
         .decrypt(XNonce::from_slice(&nonce), ct.as_ref())
         .map_err(|_| CoreError::Key("wrong passphrase or corrupt backup file".into()))?;
-    let jwk = String::from_utf8(pt.clone())
-        .map_err(|e| CoreError::Key(format!("decrypted backup not utf8: {e}")))?;
-    pt.zeroize();
-    Ok(jwk)
+    // Move `pt` into the String (no extra un-wiped copy). The returned secret is
+    // the caller's to protect — the bridge holds it in a Zeroizing session.
+    String::from_utf8(pt)
+        .map_err(|e| CoreError::Key(format!("decrypted backup not utf8: {e}")))
 }
 
 #[cfg(test)]

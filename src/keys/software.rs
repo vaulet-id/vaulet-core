@@ -1,14 +1,17 @@
-//! Software key (P-256) — temporary for M1 sprint 1.
+//! Software key (P-256).
 //!
-//! ⚠️ Production path (PLAN.md D3): keys must live in the Secure
-//! Enclave/StrongBox behind the `HardwareSigner` trait. This struct exists so
-//! the full flow works now, and as a fallback for platforms without secure
-//! hardware. The key file on disk is NOT encrypted — internal builds only.
+//! The private scalar is derived in memory from the seed (ADR 0008) and is
+//! NEVER persisted by the core — the seed lives in the platform Keychain
+//! (`ThisDeviceOnly`) and is loaded into a session per app run. `p256::SecretKey`
+//! zeroizes its scalar on drop; raw exports here are wiped after use. The
+//! hardware-backed `HardwareSigner` path (Secure Enclave/StrongBox) remains the
+//! future upgrade for a non-exportable signing key.
 
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::{FieldBytes, SecretKey};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 use crate::{CoreError, Result};
 
@@ -46,9 +49,10 @@ impl SoftwareKey {
     /// Raw 32-byte private scalar (the P-256 `d` value, big-endian).
     /// This is the entropy the BIP39 recovery phrase encodes (ADR 0001).
     pub fn to_scalar_bytes(&self) -> [u8; 32] {
-        let fb = self.secret.to_bytes();
+        let mut fb = self.secret.to_bytes();
         let mut out = [0u8; 32];
         out.copy_from_slice(&fb);
+        fb.as_mut_slice().zeroize(); // wipe the intermediate copy of the scalar
         out
     }
 

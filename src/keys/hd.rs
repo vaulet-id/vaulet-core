@@ -10,6 +10,7 @@ use hmac::{Hmac, Mac};
 use p256::elliptic_curve::ff::{Field, PrimeField};
 use p256::{FieldBytes, Scalar};
 use sha2::Sha512;
+use zeroize::Zeroize;
 
 type HmacSha512 = Hmac<Sha512>;
 
@@ -29,6 +30,15 @@ pub const IDENTITY_PATH: [u32; 3] = [VAULET_PURPOSE, 0, 0];
 struct Node {
     key: [u8; 32],
     chain: [u8; 32],
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // Wipe the derived private scalar (and chain code) from memory when a
+        // node is replaced mid-derivation or the final node is dropped.
+        self.key.zeroize();
+        self.chain.zeroize();
+    }
 }
 
 fn hmac512(key: &[u8], data: &[u8]) -> [u8; 64] {
@@ -53,15 +63,18 @@ fn is_valid(b: &[u8; 32]) -> bool {
 fn master(seed: &[u8]) -> Node {
     let mut i = hmac512(b"Nist256p1 seed", seed);
     loop {
-        let il: [u8; 32] = i[..32].try_into().unwrap();
+        let mut il: [u8; 32] = i[..32].try_into().unwrap();
         if is_valid(&il) {
             let mut key = [0u8; 32];
             let mut chain = [0u8; 32];
             key.copy_from_slice(&i[..32]);
             chain.copy_from_slice(&i[32..]);
+            il.zeroize();
+            i.zeroize(); // wipe the HMAC output (holds the private I_L)
             return Node { key, chain };
         }
         // Invalid master (I_L is 0 or >= n): re-hash. Vanishingly rare for P-256.
+        il.zeroize();
         i = hmac512(b"Nist256p1 seed", &i);
     }
 }
@@ -76,18 +89,23 @@ fn derive_hardened(node: &Node, index: u32) -> Node {
     data.extend_from_slice(&hindex.to_be_bytes());
     let kpar = scalar_from(&node.key).expect("parent key is a valid scalar");
     loop {
-        let i = hmac512(&node.chain, &data);
-        let il: [u8; 32] = i[..32].try_into().unwrap();
+        let mut i = hmac512(&node.chain, &data);
+        let mut il: [u8; 32] = i[..32].try_into().unwrap();
         let ir: [u8; 32] = i[32..].try_into().unwrap();
         if let Some(il_s) = scalar_from(&il) {
             let ki = il_s + kpar; // (parse256(I_L) + k_par) mod n
             if !bool::from(ki.is_zero()) {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(ki.to_repr().as_slice());
+                il.zeroize();
+                i.zeroize();
+                data.zeroize(); // heap buffer held 0x00 || parent_scalar || idx
                 return Node { key, chain: ir };
             }
         }
         // Invalid child (I_L >= n or k_i == 0): retry with 0x01 || I_R || ser32(i).
+        il.zeroize();
+        i.zeroize();
         data.clear();
         data.push(0x01);
         data.extend_from_slice(&ir);
