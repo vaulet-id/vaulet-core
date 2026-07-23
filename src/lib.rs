@@ -43,9 +43,16 @@ pub fn wallet_init(storage_dir: &str) -> Result<did::WalletIdentity> {
             .map_err(|e| CoreError::Key(format!("read key file: {e}")))?;
         SoftwareKey::from_jwk(&jwk)?
     } else {
-        let key = SoftwareKey::generate();
+        // Seed-first (ADR 0008): a fresh BIP39 mnemonic is the seed root; the
+        // identity key is SLIP-0010 P-256 at m/1077'/0'/0'. We persist the
+        // mnemonic (the backup root) AND the derived working key so the rest of
+        // the core keeps reading wallet_key.jwk unchanged.
+        let mnemonic = mnemonic::generate()?;
+        let key = derive_identity_key(&mnemonic)?;
         std::fs::create_dir_all(storage_dir)
             .map_err(|e| CoreError::Key(format!("create storage dir: {e}")))?;
+        std::fs::write(seed_path(storage_dir), &mnemonic)
+            .map_err(|e| CoreError::Key(format!("write seed file: {e}")))?;
         std::fs::write(&key_path, key.to_jwk_string())
             .map_err(|e| CoreError::Key(format!("write key file: {e}")))?;
         key
@@ -54,6 +61,20 @@ pub fn wallet_init(storage_dir: &str) -> Result<did::WalletIdentity> {
     let public_jwk = key.public_jwk()?;
     let did = did::did_jwk_from_public(&public_jwk)?;
     Ok(did::WalletIdentity { did, public_jwk })
+}
+
+/// Path to the persisted seed root (the BIP39 mnemonic) — present on seed-first
+/// wallets, absent on legacy (ADR 0001 Approach A) ones.
+fn seed_path(storage_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(storage_dir).join("wallet_mnemonic.txt")
+}
+
+/// Derive the P-256 identity key from a BIP39 mnemonic via the seed (ADR 0008).
+/// Errors on an invalid mnemonic before anything is written.
+fn derive_identity_key(mnemonic: &str) -> Result<keys::software::SoftwareKey> {
+    let seed = mnemonic::to_seed(mnemonic)?;
+    let scalar = keys::hd::derive_identity_scalar(&seed);
+    keys::software::SoftwareKey::from_scalar_bytes(&scalar)
 }
 
 /// Whether a wallet exists on this device — decides if onboarding is needed.
@@ -71,6 +92,12 @@ pub fn wallet_reset(storage_dir: &str) -> Result<()> {
         std::fs::remove_file(&key_path)
             .map_err(|e| CoreError::Key(format!("delete key file: {e}")))?;
     }
+    // Delete the seed root too (seed-first wallets).
+    let seed = seed_path(storage_dir);
+    if seed.exists() {
+        std::fs::remove_file(&seed)
+            .map_err(|e| CoreError::Key(format!("delete seed file: {e}")))?;
+    }
     // Clear the phrase lock so a fresh identity can back up by phrase again.
     let marker = std::path::Path::new(storage_dir).join("phrase_locked");
     if marker.exists() {
@@ -83,10 +110,19 @@ pub fn wallet_reset(storage_dir: &str) -> Result<()> {
 /// Encrypt the on-device key into a passphrase-protected recovery file (M1
 /// backup — PLAN.md D3). Returns the envelope JSON the UI saves to iCloud/Files.
 pub fn wallet_export_backup(storage_dir: &str, passphrase: &str) -> Result<String> {
-    let key_path = std::path::Path::new(storage_dir).join("wallet_key.jwk");
-    let jwk = std::fs::read_to_string(&key_path)
-        .map_err(|e| CoreError::Key(format!("read key file: {e}")))?;
-    recovery::encrypt_backup(&jwk, passphrase)
+    // Seed-first: back up the SEED (mnemonic), so a restore re-derives every
+    // facility, not just the identity key (ADR 0008). Legacy wallets back up the
+    // raw key jwk as before.
+    let seed = seed_path(storage_dir);
+    let secret = if seed.exists() {
+        std::fs::read_to_string(&seed)
+            .map_err(|e| CoreError::Key(format!("read seed file: {e}")))?
+    } else {
+        let key_path = std::path::Path::new(storage_dir).join("wallet_key.jwk");
+        std::fs::read_to_string(&key_path)
+            .map_err(|e| CoreError::Key(format!("read key file: {e}")))?
+    };
+    recovery::encrypt_backup(secret.trim(), passphrase)
 }
 
 /// Restore a wallet from a recovery file + passphrase, writing the key to
@@ -98,15 +134,26 @@ pub fn wallet_import_backup(
 ) -> Result<did::WalletIdentity> {
     use keys::software::SoftwareKey;
 
-    let jwk = recovery::decrypt_backup(envelope, passphrase)?;
-    // Validate the decrypted material is a usable key before touching disk.
-    let key = SoftwareKey::from_jwk(&jwk)?;
+    let plain = recovery::decrypt_backup(envelope, passphrase)?;
 
     std::fs::create_dir_all(storage_dir)
         .map_err(|e| CoreError::Key(format!("create storage dir: {e}")))?;
     let key_path = std::path::Path::new(storage_dir).join("wallet_key.jwk");
-    std::fs::write(&key_path, &jwk)
-        .map_err(|e| CoreError::Key(format!("write key file: {e}")))?;
+
+    // Seed-first backups hold a mnemonic; legacy backups hold the raw key jwk.
+    // A mnemonic parses via derive_identity_key; a jwk does not.
+    let key = if let Ok(key) = derive_identity_key(plain.trim()) {
+        std::fs::write(seed_path(storage_dir), plain.trim())
+            .map_err(|e| CoreError::Key(format!("write seed file: {e}")))?;
+        std::fs::write(&key_path, key.to_jwk_string())
+            .map_err(|e| CoreError::Key(format!("write key file: {e}")))?;
+        key
+    } else {
+        let key = SoftwareKey::from_jwk(&plain)?;
+        std::fs::write(&key_path, &plain)
+            .map_err(|e| CoreError::Key(format!("write key file: {e}")))?;
+        key
+    };
 
     let public_jwk = key.public_jwk()?;
     let did = did::did_jwk_from_public(&public_jwk)?;
@@ -122,6 +169,14 @@ pub fn wallet_export_phrase(storage_dir: &str) -> Result<String> {
     if phrase_locked(storage_dir) {
         return Err(CoreError::Key("recovery phrase is locked on this device".into()));
     }
+    // Seed-first wallet: the phrase IS the stored seed mnemonic (ADR 0008).
+    let seed = seed_path(storage_dir);
+    if seed.exists() {
+        let mnemonic = std::fs::read_to_string(&seed)
+            .map_err(|e| CoreError::Key(format!("read seed file: {e}")))?;
+        return Ok(mnemonic.trim().to_string());
+    }
+    // Legacy (ADR 0001 Approach A): encode the raw scalar as the phrase.
     let key_path = std::path::Path::new(storage_dir).join("wallet_key.jwk");
     let jwk = std::fs::read_to_string(&key_path)
         .map_err(|e| CoreError::Key(format!("read key file: {e}")))?;
@@ -133,14 +188,15 @@ pub fn wallet_export_phrase(storage_dir: &str) -> Result<String> {
 /// `storage_dir` and returning the identity. A bad word, wrong length, failed
 /// checksum, or out-of-range scalar all fail before anything is written.
 pub fn wallet_import_phrase(storage_dir: &str, phrase: &str) -> Result<did::WalletIdentity> {
-    use keys::software::SoftwareKey;
-
-    let scalar = mnemonic::decode_key(phrase)?;
-    // from_scalar_bytes validates the scalar is in [1, n-1] for P-256.
-    let key = SoftwareKey::from_scalar_bytes(&scalar)?;
+    // Seed-first (ADR 0008): the phrase is the BIP39 seed; the identity key is
+    // SLIP-0010 P-256 at m/1077'/0'/0'. Validates the phrase before writing.
+    let phrase = phrase.trim();
+    let key = derive_identity_key(phrase)?;
 
     std::fs::create_dir_all(storage_dir)
         .map_err(|e| CoreError::Key(format!("create storage dir: {e}")))?;
+    std::fs::write(seed_path(storage_dir), phrase)
+        .map_err(|e| CoreError::Key(format!("write seed file: {e}")))?;
     let key_path = std::path::Path::new(storage_dir).join("wallet_key.jwk");
     std::fs::write(&key_path, key.to_jwk_string())
         .map_err(|e| CoreError::Key(format!("write key file: {e}")))?;

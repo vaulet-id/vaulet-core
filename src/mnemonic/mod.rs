@@ -7,8 +7,26 @@
 //! key-generation scheme.
 
 use bip39::Mnemonic;
+use rand_core::{OsRng, RngCore};
 
 use crate::{CoreError, Result};
+
+/// Generate a fresh 24-word BIP39 mnemonic from 256 bits of OS entropy. This is
+/// the seed root of the seed-first key model (ADR 0008) — NOT a scalar encoding.
+pub fn generate() -> Result<String> {
+    let mut entropy = [0u8; 32];
+    OsRng.fill_bytes(&mut entropy);
+    let mnemonic = Mnemonic::from_entropy(&entropy)
+        .map_err(|e| CoreError::Key(format!("mnemonic generate: {e}")))?;
+    Ok(mnemonic.to_string())
+}
+
+/// The BIP39 512-bit seed for `phrase` (empty passphrase). Validates the phrase.
+pub fn to_seed(phrase: &str) -> Result<[u8; 64]> {
+    let mnemonic = Mnemonic::parse(phrase.trim())
+        .map_err(|_| CoreError::Key("invalid recovery phrase".into()))?;
+    Ok(mnemonic.to_seed(""))
+}
 
 /// Encode a 32-byte scalar as a 24-word English BIP39 mnemonic.
 pub fn encode_key(scalar: &[u8; 32]) -> Result<String> {

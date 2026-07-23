@@ -3,6 +3,7 @@
 //! sees a handle. Every signature goes through a platform channel to hardware.
 //! Shamir recovery (2-of-3, custom n-of-m) arrives in M3.
 
+pub mod hd;
 pub mod software;
 
 use serde::{Deserialize, Serialize};
