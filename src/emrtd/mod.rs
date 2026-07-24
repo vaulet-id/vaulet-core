@@ -281,16 +281,220 @@ fn signed_data_econtent(ci: &[u8]) -> Result<Vec<u8>> {
 // SOD signature + chain, Active Authentication (staged — see notes)
 // ---------------------------------------------------------------------------
 
-/// Verify the SOD signer's signature and the DSC→CSCA chain. Staged: the full
-/// signedAttrs re-encode + multi-algorithm verify + chain building land next; for
-/// now it reports the chain as NoAnchor when the trust store is empty.
+const OID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+
+/// Verify the SOD signer's signature (SignerInfo over signedAttrs, with the
+/// messageDigest attribute bound to the LDS eContent) against the embedded DSC,
+/// then chain the DSC to a trusted CSCA. Errors surface as notes and a `false`
+/// verdict rather than aborting the whole read.
 fn verify_sod_signature(
-    _ci: &[u8],
+    ci: &[u8],
     csca: &[Vec<u8>],
     notes: &mut Vec<String>,
 ) -> (bool, ChainStatus) {
-    notes.push("SOD signature verify staged (integrity only for now)".into());
-    (false, if csca.is_empty() { ChainStatus::NoAnchor } else { ChainStatus::NoAnchor })
+    match verify_sod_inner(ci, csca, notes) {
+        Ok(v) => v,
+        Err(e) => {
+            notes.push(format!("SOD signature: {e}"));
+            (false, ChainStatus::NoAnchor)
+        }
+    }
+}
+
+fn verify_sod_inner(
+    ci: &[u8],
+    csca: &[Vec<u8>],
+    notes: &mut Vec<String>,
+) -> Result<(bool, ChainStatus)> {
+    use cms::cert::CertificateChoices;
+    use cms::content_info::ContentInfo;
+    use cms::signed_data::SignedData;
+    use der::Encode;
+
+    let bad = |m: String| CoreError::Credential(m);
+    let info = ContentInfo::from_der(ci).map_err(|e| bad(format!("ContentInfo: {e}")))?;
+    let sd: SignedData = info
+        .content
+        .decode_as()
+        .map_err(|e| bad(format!("SignedData: {e}")))?;
+
+    // Document Signer Certificate (first embedded X.509).
+    let dsc = sd
+        .certificates
+        .as_ref()
+        .and_then(|set| {
+            set.0.iter().find_map(|c| match c {
+                CertificateChoices::Certificate(cert) => Some(cert.clone()),
+                _ => None,
+            })
+        })
+        .ok_or_else(|| bad("SOD has no DSC certificate".into()))?;
+
+    let si = sd
+        .signer_infos
+        .0
+        .iter()
+        .next()
+        .ok_or_else(|| bad("SOD has no signerInfo".into()))?;
+    let hash_algo = hash_name(&si.digest_alg.oid);
+
+    // The LDS eContent bytes — what messageDigest is taken over.
+    let lds_der = signed_data_econtent(ci)?;
+
+    // Message the signature actually covers: the re-encoded signedAttrs (SET OF),
+    // after checking its messageDigest binds to the eContent. If there are no
+    // signedAttrs, the signature is directly over the eContent.
+    let signed_msg: Vec<u8> = if let Some(attrs) = &si.signed_attrs {
+        let md_attr = attrs
+            .iter()
+            .find(|a| a.oid == OID_MESSAGE_DIGEST)
+            .ok_or_else(|| bad("no messageDigest attribute".into()))?;
+        let md_any = md_attr
+            .values
+            .iter()
+            .next()
+            .ok_or_else(|| bad("empty messageDigest".into()))?;
+        let md = md_any
+            .decode_as::<OctetStringRef>()
+            .map_err(|e| bad(format!("messageDigest: {e}")))?;
+        if md.as_bytes() != digest(&hash_algo, &lds_der).as_slice() {
+            return Err(bad("messageDigest does not match eContent".into()));
+        }
+        // to_der() on the SignedAttributes (SET OF) emits the 0x31 SET tag that
+        // RFC 5652 §5.4 requires for the signature, not the [0] IMPLICIT tag.
+        attrs.to_der().map_err(|e| bad(format!("signedAttrs: {e}")))?
+    } else {
+        lds_der.clone()
+    };
+
+    let spki_der = dsc
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|e| bad(format!("DSC SPKI: {e}")))?;
+    let sod_ok = verify_signature(
+        &spki_der,
+        &si.signature_algorithm.oid,
+        &hash_algo,
+        &signed_msg,
+        si.signature.as_bytes(),
+    )
+    .unwrap_or_else(|e| {
+        notes.push(format!("SOD signature verify: {e}"));
+        false
+    });
+    if !sod_ok {
+        notes.push("SOD signature did not verify against the DSC".into());
+    }
+
+    // DSC → CSCA chain: the DSC's own signature must verify under a trusted CSCA.
+    let chain = if csca.is_empty() {
+        ChainStatus::NoAnchor
+    } else {
+        verify_dsc_chain(&dsc, csca, notes)
+    };
+    Ok((sod_ok, chain))
+}
+
+/// Try to verify the DSC's certificate signature under each provided CSCA's
+/// public key. Trusted on the first match, else Failed.
+fn verify_dsc_chain(
+    dsc: &x509_cert::Certificate,
+    csca: &[Vec<u8>],
+    notes: &mut Vec<String>,
+) -> ChainStatus {
+    use der::Encode;
+    let tbs = match dsc.tbs_certificate.to_der() {
+        Ok(b) => b,
+        Err(e) => {
+            notes.push(format!("DSC tbs: {e}"));
+            return ChainStatus::Failed;
+        }
+    };
+    let sig = dsc.signature.raw_bytes();
+    let sig_hash = hash_name(&dsc.signature_algorithm.oid);
+    for ca_der in csca {
+        let ca = match x509_cert::Certificate::from_der(ca_der) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let ca_spki = match ca.tbs_certificate.subject_public_key_info.to_der() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if verify_signature(
+            &ca_spki,
+            &dsc.signature_algorithm.oid,
+            &sig_hash,
+            &tbs,
+            sig,
+        )
+        .unwrap_or(false)
+        {
+            return ChainStatus::Trusted;
+        }
+    }
+    ChainStatus::Failed
+}
+
+/// Verify `signature` over `msg` using the SPKI public key and the signature
+/// algorithm OID. Supports RSA PKCS#1 v1.5, RSA-PSS, and ECDSA (P-256/P-384).
+fn verify_signature(
+    spki_der: &[u8],
+    sig_alg: &ObjectIdentifier,
+    hash_algo: &str,
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<bool> {
+    let bad = |m: String| CoreError::Credential(m);
+    let oid = sig_alg.to_string();
+    let hashed = digest(hash_algo, msg);
+
+    // ECDSA (X9.62): 1.2.840.10045.4.3.x
+    if oid.starts_with("1.2.840.10045.4.3") {
+        // Curve comes from the key; try P-256 then P-384 with prehashed digest.
+        use ecdsa::signature::hazmat::PrehashVerifier;
+        use spki::DecodePublicKey;
+        if let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_der(spki_der) {
+            let s = p256::ecdsa::Signature::from_der(sig)
+                .map_err(|e| bad(format!("ECDSA sig: {e}")))?;
+            return Ok(vk.verify_prehash(&hashed, &s).is_ok());
+        }
+        if let Ok(vk) = p384::ecdsa::VerifyingKey::from_public_key_der(spki_der) {
+            let s = p384::ecdsa::Signature::from_der(sig)
+                .map_err(|e| bad(format!("ECDSA sig: {e}")))?;
+            return Ok(vk.verify_prehash(&hashed, &s).is_ok());
+        }
+        return Err(bad("unsupported ECDSA curve".into()));
+    }
+
+    // RSA: rsaEncryption / sha*WithRSAEncryption (PKCS#1 v1.5) or RSASSA-PSS.
+    if oid.starts_with("1.2.840.113549.1.1") {
+        use rsa::pkcs8::DecodePublicKey;
+        let key = rsa::RsaPublicKey::from_public_key_der(spki_der)
+            .map_err(|e| bad(format!("RSA key: {e}")))?;
+        if oid == "1.2.840.113549.1.1.10" {
+            // RSASSA-PSS (params default to the digest's own MGF1/salt for eMRTD).
+            let ok = match hash_algo {
+                "SHA-1" => key.verify(rsa::pss::Pss::new::<Sha1>(), &hashed, sig).is_ok(),
+                "SHA-224" => key.verify(rsa::pss::Pss::new::<Sha224>(), &hashed, sig).is_ok(),
+                "SHA-384" => key.verify(rsa::pss::Pss::new::<Sha384>(), &hashed, sig).is_ok(),
+                "SHA-512" => key.verify(rsa::pss::Pss::new::<Sha512>(), &hashed, sig).is_ok(),
+                _ => key.verify(rsa::pss::Pss::new::<Sha256>(), &hashed, sig).is_ok(),
+            };
+            return Ok(ok);
+        }
+        let ok = match hash_algo {
+            "SHA-1" => key.verify(rsa::Pkcs1v15Sign::new::<Sha1>(), &hashed, sig).is_ok(),
+            "SHA-224" => key.verify(rsa::Pkcs1v15Sign::new::<Sha224>(), &hashed, sig).is_ok(),
+            "SHA-384" => key.verify(rsa::Pkcs1v15Sign::new::<Sha384>(), &hashed, sig).is_ok(),
+            "SHA-512" => key.verify(rsa::Pkcs1v15Sign::new::<Sha512>(), &hashed, sig).is_ok(),
+            _ => key.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &hashed, sig).is_ok(),
+        };
+        return Ok(ok);
+    }
+
+    Err(bad(format!("unsupported signature algorithm {oid}")))
 }
 
 /// Verify the chip's Active Authentication signature over the challenge. Staged.
