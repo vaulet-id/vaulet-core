@@ -220,6 +220,28 @@ pub fn wallet_build_proof_jwt(
     Ok(proof.jwt)
 }
 
+/// Self-issue an SD-JWT VC signed by the identity key — the issuer and holder are
+/// both the user's own did:jwk (a self-asserted credential, ADR: self-asserted =
+/// lowest assurance). `claims_json` is a JSON object of always-visible (Z2)
+/// claims. Used e.g. to store a liveness scan result in the wallet.
+pub fn wallet_self_issue(secret: &str, vct: &str, claims_json: &str, iat: i64) -> Result<String> {
+    let key = load_secret_key(secret)?;
+    let holder_jwk = key.public_jwk()?;
+    let did = did::did_jwk_from_public(&holder_jwk)?;
+    let visible: serde_json::Map<String, serde_json::Value> = serde_json::from_str(claims_json)
+        .map_err(|e| CoreError::Credential(format!("self-issue claims json: {e}")))?;
+    let params = credential::IssueParams {
+        vct: vct.to_string(),
+        iss: did,
+        iat,
+        exp: iat + 315_360_000, // ~10 years
+        holder_jwk,
+        disclosable: serde_json::Map::new(),
+        visible,
+    };
+    credential::issue(params, &key)
+}
+
 /// Present a held SD-JWT VC to satisfy a Form's OID4VP ask (ADR 0003 form-gated
 /// issuance): disclose exactly `disclose` from the stored issuer-signed `sd_jwt`
 /// and append a holder KB-JWT bound to `audience` (verifier) and `nonce` (the
