@@ -6,6 +6,7 @@
 
 pub mod credential;
 pub mod did;
+pub mod emrtd;
 pub mod keys;
 pub mod mnemonic;
 pub mod protocol;
@@ -218,6 +219,22 @@ pub fn wallet_build_proof_jwt(
     let holder_jwk = key.public_jwk()?;
     let proof = protocol::oid4vci::holder_proof(issuer, c_nonce, iat, holder_jwk, &key)?;
     Ok(proof.jwt)
+}
+
+/// Verify an ePassport read (ADR 0009): data-group integrity against EF.SOD, plus
+/// SOD signature / DSC→CSCA chain / Active Authentication (staged). `dgs` maps DG
+/// number → raw EF bytes; `csca` is the trust store (may be empty); `aa` is
+/// `(dg15, challenge, signature)` when supported.
+pub fn wallet_verify_passport(
+    sod: &[u8],
+    dgs: std::collections::BTreeMap<u8, Vec<u8>>,
+    csca: Vec<Vec<u8>>,
+    aa: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+) -> Result<emrtd::PassportVerdict> {
+    let aa_ref = aa
+        .as_ref()
+        .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice()));
+    emrtd::verify_passport(sod, &dgs, &csca, aa_ref)
 }
 
 /// Self-issue an SD-JWT VC signed by the identity key — the issuer and holder are

@@ -23,7 +23,18 @@ bip39 = "2"
 # Shamir recovery (ADR 0002): split the 32-byte scalar over GF(256).
 sharks = "0.5"
 sha2 = "0.10"
+sha1 = "0.10"
 hmac = "0.12"
+# ePassport (eMRTD) passive/active authentication (ADR 0009): CMS SignedData
+# (EF.SOD), X.509 (DSC/CSCA), ASN.1 for the LDS security object, RSA/ECDSA verify.
+der = { version = "0.7", features = ["oid"] }
+const-oid = "0.9"
+spki = "0.7"
+x509-cert = "0.2"
+cms = "0.2"
+rsa = { version = "0.9", features = ["sha2", "sha1"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+ecdsa = "0.16"
 # SD-JWT VC + KB-JWT mechanics (ADR 0004). SoftwareKey is the external ES256
 # JwsSigner, so this crate never owns key material.
 sd-jwt-payload = "0.5.1"
