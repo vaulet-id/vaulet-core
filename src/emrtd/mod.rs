@@ -465,7 +465,13 @@ fn verify_signature(
                 .map_err(|e| bad(format!("ECDSA sig: {e}")))?;
             return Ok(vk.verify_prehash(&hashed, &s).is_ok());
         }
-        return Err(bad("unsupported ECDSA curve".into()));
+        // Unknown curve (e.g. brainpool, P-521) — name the OID so the gap is obvious.
+        let curve = spki::SubjectPublicKeyInfoRef::try_from(spki_der)
+            .ok()
+            .and_then(|s| s.algorithm.parameters_oid().ok())
+            .map(|o| o.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        return Err(bad(format!("unsupported ECDSA curve {curve}")));
     }
 
     // RSA: rsaEncryption / sha*WithRSAEncryption (PKCS#1 v1.5) or RSASSA-PSS.
