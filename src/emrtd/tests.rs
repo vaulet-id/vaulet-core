@@ -115,6 +115,106 @@ fn tampered_dg_breaks_integrity_but_not_the_chain() {
     assert!(!v.is_genuine());
 }
 
+// ---------------------------------------------------------------------------
+// Active Authentication over a synthetic chip key. The key, challenge and
+// signature are all generated here; no real chip material is involved.
+// ---------------------------------------------------------------------------
+
+/// A synthetic AA chip: EF.DG15 (`0x6F`-wrapped SubjectPublicKeyInfo) plus the
+/// signing key it would keep to itself.
+fn synthetic_aa_chip() -> (Vec<u8>, p256::ecdsa::SigningKey) {
+    use p256::pkcs8::EncodePublicKey;
+    let key = p256::ecdsa::SigningKey::from_bytes(&[13u8; 32].into()).unwrap();
+    let spki = key.verifying_key().to_public_key_der().unwrap();
+    (der_tlv_bytes(0x6f, spki.as_bytes()), key)
+}
+
+/// Sign `challenge` the way a chip does: ECDSA over its digest, raw `r || s`.
+fn aa_sign(key: &p256::ecdsa::SigningKey, algo: &str, challenge: &[u8]) -> Vec<u8> {
+    use ecdsa::signature::hazmat::PrehashSigner;
+    let sig: p256::ecdsa::Signature = key.sign_prehash(&digest(algo, challenge)).unwrap();
+    sig.to_bytes().to_vec()
+}
+
+#[test]
+fn aa_ecdsa_signature_over_the_challenge_verifies() {
+    let (dg15, key) = synthetic_aa_chip();
+    let challenge = [0x01u8, 2, 3, 4, 5, 6, 7, 8];
+    let sig = aa_sign(&key, "SHA-256", &challenge);
+    assert!(verify_active_auth(&dg15, &challenge, &sig).unwrap());
+
+    // The reader may hand us the bare SPKI instead of the whole EF.
+    let spki = strip_dg15_wrapper(&dg15).to_vec();
+    assert!(verify_active_auth(&spki, &challenge, &sig).unwrap());
+
+    // X9.62 DER is accepted alongside the raw r || s concatenation.
+    let der_sig = der_ecdsa_sig_bytes(
+        &BigU::from_bytes_be(&sig[..32]),
+        &BigU::from_bytes_be(&sig[32..]),
+    );
+    assert!(verify_active_auth(&dg15, &challenge, &der_sig).unwrap());
+
+    // A chip that hashed with SHA-1 still verifies (DG14 isn't passed to us).
+    let sha1_sig = aa_sign(&key, "SHA-1", &challenge);
+    assert!(verify_active_auth(&dg15, &challenge, &sha1_sig).unwrap());
+}
+
+#[test]
+fn aa_rejects_a_signature_over_another_challenge() {
+    let (dg15, key) = synthetic_aa_chip();
+    let sig = aa_sign(&key, "SHA-256", &[1u8, 2, 3, 4, 5, 6, 7, 8]);
+    assert!(!verify_active_auth(&dg15, &[9u8, 9, 9, 9, 9, 9, 9, 9], &sig).unwrap());
+
+    // A different chip's key must not validate this signature either.
+    let (other_dg15, _) = {
+        use p256::pkcs8::EncodePublicKey;
+        let k = p256::ecdsa::SigningKey::from_bytes(&[17u8; 32].into()).unwrap();
+        let spki = k.verifying_key().to_public_key_der().unwrap();
+        (der_tlv_bytes(0x6f, spki.as_bytes()), k)
+    };
+    assert!(!verify_active_auth(&other_dg15, &[1u8, 2, 3, 4, 5, 6, 7, 8], &sig).unwrap());
+}
+
+#[test]
+fn aa_rsa_key_reports_unsupported() {
+    // rsaEncryption SPKI (the key bits are irrelevant — dispatch is by OID).
+    let rsa_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+    let mut alg = der_tlv_bytes(0x06, rsa_oid.as_bytes());
+    alg.extend_from_slice(&der_tlv_bytes(0x05, &[])); // NULL parameters
+    let mut spki = der_tlv_bytes(0x30, &alg);
+    spki.extend_from_slice(&der_tlv_bytes(0x03, &[0x00, 0xde, 0xad]));
+    let dg15 = der_tlv_bytes(0x6f, &der_tlv_bytes(0x30, &spki));
+
+    let e = verify_active_auth(&dg15, &[0u8; 8], &[0u8; 8]).unwrap_err();
+    assert!(format!("{e}").contains("unsupported AA key type: RSA"), "{e}");
+}
+
+#[test]
+fn aa_result_flows_into_the_verdict() {
+    let p = fixtures::synthetic_passport();
+    let (dg15, key) = synthetic_aa_chip();
+    let challenge = [0x0au8, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
+    let sig = aa_sign(&key, "SHA-256", &challenge);
+
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca.clone()],
+        Some((&dg15, &challenge, &sig)),
+    )
+    .unwrap();
+    assert_eq!(v.active_auth, Some(true), "{:?}", v.notes);
+    assert!(v.is_genuine(), "{:?}", v.notes);
+
+    // A replayed signature over a different challenge fails AA and genuineness,
+    // while PA still holds.
+    let v = verify_passport(&p.sod, &p.dgs, &[p.csca], Some((&dg15, &[0u8; 8], &sig))).unwrap();
+    assert_eq!(v.active_auth, Some(false));
+    assert!(v.dg_integrity && v.sod_signature);
+    assert_eq!(v.chain, ChainStatus::Trusted);
+    assert!(!v.is_genuine());
+}
+
 #[test]
 fn strips_sod_application_wrapper() {
     let inner = b"content-info-bytes";
