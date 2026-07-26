@@ -38,8 +38,10 @@ pub struct PassportVerdict {
     pub chain: ChainStatus,
     /// Active Authentication result. `Some(false)` means the chip answered the
     /// challenge and the answer did not verify. `None` means the check did not
-    /// happen at all — no AA material was supplied, or the key type is one we
-    /// cannot verify (see `aa_unverifiable`).
+    /// happen at all — no AA material was supplied, the material was ignored
+    /// because the SOD does not cover the DG15 that carries the answering key
+    /// (the reason is in `notes`), or the key type is one we cannot verify (see
+    /// `aa_unverifiable`).
     pub active_auth: Option<bool>,
     /// AA material *was* supplied but its key type is not implemented (RSA
     /// ISO/IEC 9796-2 DSS1) or its EC curve is one this verifier cannot parse
@@ -146,21 +148,48 @@ pub fn verify_passport(
     //    is `Some(false)`: a key type or curve we cannot verify is not evidence of
     //    a clone, it is a gap in this verifier, and reporting it as a failed check
     //    would stamp genuine RSA-AA and brainpool-AA passports as inauthentic.
+    //
+    //    The answer is only worth checking when the SOD covers the DG15 that
+    //    carries the answering key. Otherwise that key is simply whatever the
+    //    caller handed us, and a signature from it proves possession of a key no
+    //    issuing state ever vouched for. Such material is *unusable*, not
+    //    incriminating: it is ignored — noted, and reported exactly as if none had
+    //    been supplied — so that a caller can never read `active_auth = true` off
+    //    a key the SOD does not cover, while a genuine but non-conformant document
+    //    whose SOD omits DG15 (an EF.COM/SOD data-group-list mismatch) is still
+    //    judged on its Passive Authentication, not disqualified by it.
     let mut active_auth = None;
     let mut aa_unverifiable = false;
     if let Some((dg15, challenge, sig)) = aa {
-        match verify_active_auth(dg15, challenge, sig) {
-            Ok(AaCheck::Verified) => active_auth = Some(true),
-            Ok(AaCheck::Failed) => active_auth = Some(false),
-            Ok(AaCheck::Unsupported(why)) => {
-                aa_unverifiable = true;
-                notes.push(format!("AA not verified: {why}"));
-            }
-            // Malformed material (DG15 that is not an SPKI, unreadable signature):
-            // the chip's own answer is unusable, which is a failed check.
-            Err(e) => {
-                active_auth = Some(false);
-                notes.push(format!("AA: {e}"));
+        // Hashed against the SOD directly rather than via `checked`, so the key
+        // that answers is the covered one even when the caller left DG15 out of
+        // `dgs` (where a substitution could not touch `dg_integrity`).
+        let covered = lds
+            .hashes
+            .get(&15)
+            .is_some_and(|expected| digest(&lds.hash_algo, dg15) == *expected);
+        if !covered {
+            notes.push(if lds.hashes.contains_key(&15) {
+                "AA ignored: the supplied DG15 is not the one the SOD covers".into()
+            } else {
+                "AA ignored: the SOD does not cover DG15".to_string()
+            });
+        } else {
+            match verify_active_auth(dg15, challenge, sig) {
+                Ok(AaCheck::Verified) => active_auth = Some(true),
+                Ok(AaCheck::Failed) => active_auth = Some(false),
+                Ok(AaCheck::Unsupported(why)) => {
+                    aa_unverifiable = true;
+                    notes.push(format!("AA not verified: {why}"));
+                }
+                // Malformed material (DG15 that is not an SPKI, unreadable
+                // signature): the chip's own answer is unusable, which is a failed
+                // check. The bytes are chip-authentic — the SOD covers them — so
+                // this is the document's own defect, not a substituted key.
+                Err(e) => {
+                    active_auth = Some(false);
+                    notes.push(format!("AA: {e}"));
+                }
             }
         }
     }
