@@ -5,6 +5,7 @@
 //! The same crate is reused by the backend (axum) and, later, WASM.
 
 pub mod credential;
+pub mod dcbor;
 pub mod did;
 pub mod emrtd;
 pub mod keys;
