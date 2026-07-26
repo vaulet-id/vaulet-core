@@ -55,6 +55,24 @@ impl PassportVerdict {
             && self.chain == ChainStatus::Trusted
             && self.active_auth != Some(false)
     }
+
+    /// Which of `required` the SOD did **not** cover, in the order given.
+    ///
+    /// `dg_integrity` only speaks for the data groups the SOD's
+    /// LDSSecurityObject lists: one the caller supplied but the SOD never
+    /// covered is not hashed, does not appear in `checked_dgs`, and cannot make
+    /// integrity fail. So a caller that *relies* on a data group (builds claims
+    /// from it, hashes it, trusts a key it carries) must also require that the
+    /// group was actually covered — otherwise the bytes are attacker-chosen.
+    /// Which groups those are is the caller's business; the check lives here so
+    /// every caller asks the question the same way.
+    pub fn uncovered_dgs(&self, required: &[u8]) -> Vec<u8> {
+        required
+            .iter()
+            .copied()
+            .filter(|num| !self.checked_dgs.contains(num))
+            .collect()
+    }
 }
 
 const OID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");

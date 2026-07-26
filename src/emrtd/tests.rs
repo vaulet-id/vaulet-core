@@ -189,6 +189,8 @@ fn aa_rsa_key_reports_unsupported() {
     assert!(format!("{e}").contains("unsupported AA key type: RSA"), "{e}");
 }
 
+/// The AA result reaching the verdict, on its own. Whether the SOD covered the
+/// DG15 that answered is a separate question — see `uncovered_dgs` below.
 #[test]
 fn aa_result_flows_into_the_verdict() {
     let p = fixtures::synthetic_passport();
@@ -220,19 +222,20 @@ fn aa_result_flows_into_the_verdict() {
 // CURRENT, WRONG behaviour so the fixes visibly flip them. Every byte here is
 // synthetic (see `emrtd::fixtures`).
 //
-// H1: `verify_passport` only walks the DGs the SOD's LDSSecurityObject LISTS.
-//     A DG the caller supplies but the SOD never covered is silently ignored —
-//     not hashed, not in `checked_dgs`, no effect on `dg_integrity`.
+// H1 (closed): `verify_passport` only walks the DGs the SOD's LDSSecurityObject
+//     LISTS. A DG the caller supplies but the SOD never covered is still
+//     silently ignored by `dg_integrity` — so `uncovered_dgs` now names it, and
+//     a caller that relies on that group refuses to issue.
 // H2: the AA gate is bypassable by omission — no AA material means
 //     `active_auth = None`, which nothing treats as a failure, even when the SOD
 //     itself says the document has an AA key.
 // ---------------------------------------------------------------------------
 
 /// A passport whose SOD covers DG1/DG2 and an AA key it never signed: the SOD
-/// lists no DG15, so today the attacker's own key answers the challenge and the
-/// verdict reads as a genuine anti-clone proof.
+/// lists no DG15, so the attacker's own key answers the challenge. `dg_integrity`
+/// cannot see this — `uncovered_dgs` is what names the uncovered group.
 #[test]
-fn hole_h1_dg15_absent_from_the_sod_is_currently_accepted() {
+fn dg15_absent_from_the_sod_is_reported_as_uncovered() {
     let p = fixtures::synthetic_passport();
     // The SOD covers DG1 and DG2 only — no DG15 hash.
     assert_eq!(p.dgs.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
@@ -249,22 +252,27 @@ fn hole_h1_dg15_absent_from_the_sod_is_currently_accepted() {
 
     let v = verify_passport(&p.sod, &dgs, &[p.csca], Some((&attacker_dg15, &challenge, &sig)))
         .unwrap();
-    // WRONG (today): the substituted key is never checked against the SOD, yet it
-    // is credited with a passing Active Authentication.
+    // The substituted key answers the challenge and PA has nothing to say about
+    // it: DG15 never entered the integrity check at all.
     assert_eq!(v.active_auth, Some(true), "{:?}", v.notes);
     assert!(v.dg_integrity, "{:?}", v.notes);
     assert!(v.sod_signature, "{:?}", v.notes);
     assert_eq!(v.chain, ChainStatus::Trusted);
-    // DG15 never entered the integrity check at all.
     assert_eq!(v.checked_dgs, vec![1, 2]);
-    assert!(v.is_genuine(), "{:?}", v.notes);
+
+    // THE FIX: a caller that relies on the AA key asks whether the SOD covered
+    // it, and is told that it did not. (The backend refuses issuance on this.)
+    assert_eq!(v.uncovered_dgs(&[1, 2, 15]), vec![15]);
+    // The groups the SOD did cover are not flagged.
+    assert!(v.uncovered_dgs(&[1, 2]).is_empty());
 }
 
-/// The same shape for DG2: a SOD that covers DG1 only accepts any DG2 the caller
-/// invents. The backend hashes that DG2 into `portrait_hash` and discloses it as
-/// the `dg2` claim the face-verification issuer matches against.
+/// The same shape for DG2: a SOD that covers DG1 only lets the caller invent a
+/// DG2 without breaking integrity. The backend hashes that DG2 into
+/// `portrait_hash` and discloses it as the `dg2` claim the face-verification
+/// issuer matches against, so it must ask whether DG2 was covered.
 #[test]
-fn hole_h1_dg2_absent_from_the_sod_is_currently_accepted() {
+fn dg2_absent_from_the_sod_is_reported_as_uncovered() {
     let mut covered = BTreeMap::new();
     covered.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
     let p = fixtures::synthetic_passport_with_dgs(covered);
@@ -273,10 +281,30 @@ fn hole_h1_dg2_absent_from_the_sod_is_currently_accepted() {
     dgs.insert(2, b"ATTACKER-CHOSEN-FACE-NOT-IN-THE-SOD".to_vec());
 
     let v = verify_passport(&p.sod, &dgs, &[p.csca], None).unwrap();
-    // WRONG (today): an uncovered DG2 rides along as authentic.
+    // Integrity holds — the uncovered DG2 was simply never hashed.
     assert!(v.dg_integrity, "{:?}", v.notes);
     assert_eq!(v.checked_dgs, vec![1]);
-    assert!(v.is_genuine(), "{:?}", v.notes);
+    // THE FIX: the group the credential is built from is named as uncovered,
+    // in the order asked for.
+    assert_eq!(v.uncovered_dgs(&[1, 2]), vec![2]);
+}
+
+/// A fully covered read has nothing uncovered — including the DG15 of an
+/// AA-capable document.
+#[test]
+fn every_covered_dg_is_reported_as_covered() {
+    let (dg15, _key) = synthetic_aa_chip();
+    let mut covered = BTreeMap::new();
+    covered.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    covered.insert(2u8, b"SYNTHETIC-DG2-NOT-A-REAL-FACE".to_vec());
+    covered.insert(15u8, dg15);
+    let p = fixtures::synthetic_passport_with_dgs(covered);
+
+    let v = verify_passport(&p.sod, &p.dgs, &[p.csca], None).unwrap();
+    assert_eq!(v.checked_dgs, vec![1, 2, 15]);
+    assert!(v.uncovered_dgs(&[1, 2, 15]).is_empty());
+    // A group neither read nor covered is still uncovered.
+    assert_eq!(v.uncovered_dgs(&[3]), vec![3]);
 }
 
 /// H2: the SOD lists a DG15, so this document supports Active Authentication —
