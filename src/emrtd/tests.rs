@@ -260,8 +260,11 @@ fn aa_unsupported_ec_curve_reports_unsupported_naming_the_curve() {
     }
 }
 
-/// ...and it reaches the verdict as "not checked", so a genuine passport on such
-/// a curve still issues instead of being stamped inauthentic.
+/// ...and it reaches the verdict as "not checked" rather than as a failed
+/// anti-clone check, so the evidence says what actually happened. The document
+/// still owes a proof it did not deliver — see
+/// `junk_aa_signature_on_an_rsa_key_does_not_buy_genuineness` for why the
+/// distinction is a diagnosis and not an exemption.
 #[test]
 fn unsupported_ec_curve_is_not_reported_as_a_failed_check() {
     let mut dgs = std::collections::BTreeMap::new();
@@ -286,10 +289,12 @@ fn unsupported_ec_curve_is_not_reported_as_a_failed_check() {
         "{:?}",
         v.notes
     );
-    // Passive Authentication is untouched, and the document still owes a proof.
+    // Passive Authentication is untouched, and the document still owes a proof —
+    // which an answer we could not check does not pay, so the headline verdict
+    // does not call it genuine.
     assert!(v.dg_integrity && v.sod_signature, "{:?}", v.notes);
     assert!(v.supports_active_auth());
-    assert!(v.is_genuine(), "{:?}", v.notes);
+    assert!(!v.is_genuine(), "{:?}", v.notes);
 }
 
 /// The other half of the split, pinned: a curve we *can* parse whose signature
@@ -393,14 +398,70 @@ fn unsupported_aa_key_is_not_reported_as_a_failed_check() {
     // Passive Authentication is untouched: the RSA DG15 is covered by the SOD.
     assert!(v.dg_integrity && v.sod_signature, "{:?}", v.notes);
     assert_eq!(v.checked_dgs, vec![1, 2, 15]);
-    // The document is AA-capable, so a caller that demands a proof still sees
-    // one owed — `aa_unverifiable` is how it tells "unverified" from "absent".
+    // The document is AA-capable, so a proof is still owed — `aa_unverifiable`
+    // is how a caller tells "unverified" from "absent".
     assert!(v.supports_active_auth());
-    // Pre-branch behaviour restored: a genuine RSA-AA passport is not stamped
-    // inauthentic just because we cannot check its AA key. This is the one
-    // missing AA result `is_genuine` forgives (E5) — an answer we could have
-    // checked and did not get is not forgiven.
-    assert!(v.is_genuine(), "{:?}", v.notes);
+    // ...and that distinction is a diagnosis, not a credit: the proof was not
+    // delivered, so the headline verdict is the same as for an omitted one (E6).
+    assert!(!v.is_genuine(), "{:?}", v.notes);
+}
+
+/// THE FIX (E6): an unverifiable key type is worth no more than no proof at all.
+/// `aa_unverifiable` is decided by the DG15 key type alone — the signature bytes
+/// are never read — so forgiving it handed a cloner a free pass: EF.SOD, DG1,
+/// DG2 and EF.DG15 are public data anyone who reads a genuine RSA-AA chip once
+/// walks away with, while the AA private key stays on the chip. Replaying that
+/// material with any junk signature used to be stamped `passport_authentic:
+/// true`; now the document owes a proof it did not deliver, and says so.
+#[test]
+fn junk_aa_signature_on_an_rsa_key_does_not_buy_genuineness() {
+    // A genuine RSA-AA document, read once by the attacker: everything here is
+    // public chip data, all of it covered by the issuing state's SOD.
+    let mut dgs = std::collections::BTreeMap::new();
+    dgs.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    dgs.insert(2u8, b"SYNTHETIC-DG2-NOT-A-REAL-FACE".to_vec());
+    dgs.insert(15u8, rsa_aa_chip());
+    let p = fixtures::synthetic_passport_with_dgs(dgs);
+
+    // The clone replays it with a signature it could not possibly have produced.
+    let junk = [0xFFu8; 64];
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca.clone()],
+        Some((&p.dgs[&15], &[0xA5u8; 8], &junk)),
+    )
+    .unwrap();
+
+    // Passive Authentication is perfect and the chain is trusted — the whole
+    // point of Active Authentication is that this is not enough.
+    assert!(v.dg_integrity && v.sod_signature, "{:?}", v.notes);
+    assert_eq!(v.chain, ChainStatus::Trusted);
+    assert_eq!(v.checked_dgs, vec![1, 2, 15]);
+
+    // The junk is not called a failed check — we never looked at it — but the
+    // document listed a DG15 and no verified answer arrived.
+    assert_eq!(v.active_auth, None, "{:?}", v.notes);
+    assert!(v.aa_unverifiable, "{:?}", v.notes);
+    assert!(v.supports_active_auth());
+    assert!(!v.is_genuine(), "{:?}", v.notes);
+
+    // ...and the evidence still tells this apart from an omitted proof, which
+    // reaches the same verdict with `aa_unverifiable` false.
+    let omitted = verify_passport(&p.sod, &p.dgs, &[p.csca], None).unwrap();
+    assert_eq!(omitted.active_auth, None, "{:?}", omitted.notes);
+    assert!(!omitted.aa_unverifiable, "{:?}", omitted.notes);
+    assert!(!omitted.is_genuine(), "{:?}", omitted.notes);
+    assert!(
+        v.notes.iter().any(|n| n.starts_with("AA not verified:")),
+        "{:?}",
+        v.notes
+    );
+    assert!(
+        !omitted.notes.iter().any(|n| n.starts_with("AA not verified:")),
+        "{:?}",
+        omitted.notes
+    );
 }
 
 /// The verified case, for contrast: an ECDSA AA key is checked for real, and

@@ -48,8 +48,16 @@ pub struct PassportVerdict {
     /// (named-OID brainpool, P-521), so the challenge-response was neither proved nor
     /// disproved. `active_auth` is `None` in that case, exactly as for a chip
     /// with no AA key at all; this flag is what tells the two apart, so a caller
-    /// that demands a proof can say "not verified" instead of "not supplied"
-    /// and never read the absence as success. The reason is also in `notes`.
+    /// can say "not verified" instead of "not supplied" and never read the
+    /// absence as success. The reason is also in `notes`.
+    ///
+    /// It is a *diagnosis*, never a credit: an unverified answer is not a proof,
+    /// so this flag never buys genuineness back ([`Self::active_auth_ok`]). The
+    /// key type is read off DG15 alone — the signature bytes are never looked at
+    /// — so treating it as an excuse would let anyone who once read a genuine
+    /// RSA-AA chip (EF.SOD, DG1, DG2 and EF.DG15 are all public, only the AA
+    /// private key is not) replay that material with a junk signature and be
+    /// called genuine.
     pub aa_unverifiable: bool,
     /// The SOD digest algorithm (e.g. "SHA-256").
     pub hash_algo: String,
@@ -76,23 +84,24 @@ impl PassportVerdict {
     /// Whether Active Authentication lets this document be called genuine.
     ///
     /// A chip that answered wrongly never passes. A document whose SOD lists a
-    /// DG15 ([`Self::supports_active_auth`]) owes an anti-clone proof, so a
-    /// *missing* answer does not pass either: dropping the AA material is exactly
-    /// what a cloned chip does, and without this the headline verdict could not
-    /// tell it from the chip that really proved possession.
+    /// DG15 ([`Self::supports_active_auth`]) owes an anti-clone proof, so
+    /// anything short of a *verified* answer does not pass either. There is no
+    /// exemption for a proof this verifier could not check (`aa_unverifiable`:
+    /// RSA ISO/IEC 9796-2 DSS1, an unparseable curve): "we cannot check this key
+    /// type" must not be worth more than "no proof at all", or a clone would buy
+    /// genuineness back for free by sending junk instead of nothing — the flag is
+    /// set from the DG15 key type alone, without ever looking at the signature,
+    /// and DG15 is public data anyone who read the chip once can replay.
     ///
-    /// The one absence that is forgiven is a proof we were unable to check
-    /// (`aa_unverifiable`: RSA ISO/IEC 9796-2 DSS1, an unparseable curve). That
-    /// is a gap in this verifier, not a fault of the chip, and refusing it would
-    /// stamp a large share of genuine eMRTDs inauthentic — the verdict says so
-    /// through `aa_unverifiable`, which a caller that cannot forgive it reads.
+    /// Which of the two happened still matters to a relying party, and the
+    /// verdict keeps saying it — `active_auth`, `aa_unverifiable` and `sod_dgs`
+    /// separate "answered wrongly" from "answered with a key type we do not
+    /// implement" from "did not answer" — but none of them is a proof, so none of
+    /// them reaches this far.
     ///
     /// A document whose SOD lists no DG15 has nothing to prove, so it is genuine
     /// without an AA result, exactly as before.
     fn active_auth_ok(&self) -> bool {
-        if self.aa_unverifiable {
-            return self.active_auth != Some(false);
-        }
         if self.supports_active_auth() {
             return self.active_auth == Some(true);
         }
@@ -172,8 +181,10 @@ pub fn verify_passport(
 
     // 4) Active Authentication. Only a chip that answered *and* answered wrongly
     //    is `Some(false)`: a key type or curve we cannot verify is not evidence of
-    //    a clone, it is a gap in this verifier, and reporting it as a failed check
-    //    would stamp genuine RSA-AA and brainpool-AA passports as inauthentic.
+    //    a clone, it is a gap in this verifier, and accusing every genuine RSA-AA
+    //    and brainpool-AA chip of failing its anti-clone check would be a lie
+    //    about what happened. It is not a proof either — `aa_unverifiable` is a
+    //    diagnosis a caller reads, and `is_genuine` does not forgive it.
     //
     //    The answer is only worth checking when the SOD covers the DG15 that
     //    carries the answering key. Otherwise that key is simply whatever the
