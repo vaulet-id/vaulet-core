@@ -162,6 +162,13 @@ fn write_item(value: &Cbor, out: &mut Vec<u8>) -> Result<(), DcborError> {
                 write_head(0, *i as u64, out);
             } else {
                 // Major type 1 encodes -1 - n, so -1 is argument 0.
+                //
+                // The subtraction is exact across the whole range, including
+                // i64::MIN, where it lands on i64::MAX — the largest value it
+                // can produce, and still an i64. So there is no overflow to
+                // guard here, with or without overflow checks, and the Dart
+                // twin computes the same thing. `integers_span_the_whole_i64_range`
+                // pins both ends, in both languages.
                 write_head(1, (-1 - *i) as u64, out);
             }
         }
@@ -246,6 +253,31 @@ mod tests {
         assert_eq!(hex_of(&Cbor::Int(-24)), "37");
         assert_eq!(hex_of(&Cbor::Int(-25)), "3818");
         assert_eq!(hex_of(&Cbor::Int(-1000)), "3903e7");
+    }
+
+    /// The ends of the i64 range. Every integer in the envelope is an i64 an
+    /// unauthenticated caller chooses (`clock_base`, `captured_at`, `t_ms`,
+    /// `w`, `h`, `dataset.consent.ts`), so the encoder has to encode all of
+    /// them — including `i64::MIN`, where computing the major-type-1 argument
+    /// as `-1 - i` overflows: a panic with overflow checks on (the dev profile
+    /// `cargo test` and a plain `cargo run` use), a wrapped encoding without.
+    ///
+    /// app/test/dcbor_test.dart asserts these same vectors against the Dart
+    /// encoder, so a divergence at the boundary turns one of the two suites red.
+    #[test]
+    fn integers_span_the_whole_i64_range() {
+        assert_eq!(hex_of(&Cbor::Int(4294967295)), "1affffffff");
+        assert_eq!(hex_of(&Cbor::Int(4294967296)), "1b0000000100000000");
+        assert_eq!(hex_of(&Cbor::Int(i64::MAX)), "1b7fffffffffffffff");
+        assert_eq!(hex_of(&Cbor::Int(-4294967296)), "3affffffff");
+        assert_eq!(hex_of(&Cbor::Int(-4294967297)), "3b0000000100000000");
+        assert_eq!(hex_of(&Cbor::Int(i64::MIN + 1)), "3b7ffffffffffffffe");
+        assert_eq!(hex_of(&Cbor::Int(i64::MIN)), "3b7fffffffffffffff");
+
+        // The same two boundaries arriving through a JSON body, which is how a
+        // caller actually reaches this encoder.
+        assert_eq!(json_hex(&json!(i64::MAX)), "1b7fffffffffffffff");
+        assert_eq!(json_hex(&json!(i64::MIN)), "3b7fffffffffffffff");
     }
 
     /// Floats are ALWAYS float64 — the deliberate deviation from §4.2.2.
@@ -482,4 +514,34 @@ mod tests {
     /// sha256 (lowercase hex) of that encoding.
     const DOCUMENTED_VECTOR_SHA256: &str =
         "f54101592b905e04233b9c31faf367ffba981aec687f9c6aeee281bbbf751e79";
+
+    /// The same envelope with its two clock fields pushed to the ends of the
+    /// i64 range — the values a caller can put in `captured_at` / `clock_base`
+    /// and the ones a `-1 - i` encoder gets wrong. Encoding them through the
+    /// whole envelope (rather than as bare integers) is what pins the boundary
+    /// against the device: app/test/belt_bundle_test.dart builds the same
+    /// bundle and asserts this same hash.
+    fn belt_envelope_at_the_integer_boundaries_fixture() -> serde_json::Value {
+        let mut env = belt_envelope_fixture();
+        env["captured_at"] = json!(i64::MAX);
+        env["clock_base"] = json!(i64::MIN);
+        env
+    }
+
+    #[test]
+    fn belt_envelope_at_the_integer_boundaries_matches_the_shared_test_vector() {
+        let bytes =
+            encode(&Cbor::from_json(&belt_envelope_at_the_integer_boundaries_fixture()).unwrap())
+                .unwrap();
+        let digest = to_hex(&Sha256::digest(&bytes));
+
+        assert_eq!(bytes.len(), BOUNDARY_VECTOR_LEN);
+        assert_eq!(digest, BOUNDARY_VECTOR_SHA256);
+    }
+
+    /// Length in bytes of the encoding of the boundary fixture.
+    const BOUNDARY_VECTOR_LEN: usize = 748;
+    /// sha256 (lowercase hex) of that encoding.
+    const BOUNDARY_VECTOR_SHA256: &str =
+        "5c6f8b1b3eb17fbf0357deaa46ae8f3dc880b393074b5b536990ce459baf7098";
 }
