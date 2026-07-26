@@ -757,5 +757,10 @@ fn hash_name(oid: &ObjectIdentifier) -> String {
     .to_string()
 }
 
+/// Synthetic SOD/DSC/CSCA builders for tests (see `fixtures`). Enabled for this
+/// crate's own tests and, via the `test-fixtures` feature, for the backend's.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixtures;
+
 #[cfg(test)]
 mod tests;
