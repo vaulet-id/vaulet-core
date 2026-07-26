@@ -64,13 +64,39 @@ pub struct PassportVerdict {
 }
 
 impl PassportVerdict {
-    /// Genuine document: integrity + signature + a trusted chain. (AA, when
-    /// present, must also hold.)
+    /// Genuine document: integrity + signature + a trusted chain, and an Active
+    /// Authentication result that does not stand in the way ([`Self::active_auth_ok`]).
     pub fn is_genuine(&self) -> bool {
         self.dg_integrity
             && self.sod_signature
             && self.chain == ChainStatus::Trusted
-            && self.active_auth != Some(false)
+            && self.active_auth_ok()
+    }
+
+    /// Whether Active Authentication lets this document be called genuine.
+    ///
+    /// A chip that answered wrongly never passes. A document whose SOD lists a
+    /// DG15 ([`Self::supports_active_auth`]) owes an anti-clone proof, so a
+    /// *missing* answer does not pass either: dropping the AA material is exactly
+    /// what a cloned chip does, and without this the headline verdict could not
+    /// tell it from the chip that really proved possession.
+    ///
+    /// The one absence that is forgiven is a proof we were unable to check
+    /// (`aa_unverifiable`: RSA ISO/IEC 9796-2 DSS1, an unparseable curve). That
+    /// is a gap in this verifier, not a fault of the chip, and refusing it would
+    /// stamp a large share of genuine eMRTDs inauthentic — the verdict says so
+    /// through `aa_unverifiable`, which a caller that cannot forgive it reads.
+    ///
+    /// A document whose SOD lists no DG15 has nothing to prove, so it is genuine
+    /// without an AA result, exactly as before.
+    fn active_auth_ok(&self) -> bool {
+        if self.aa_unverifiable {
+            return self.active_auth != Some(false);
+        }
+        if self.supports_active_auth() {
+            return self.active_auth == Some(true);
+        }
+        self.active_auth != Some(false)
     }
 
     /// Which of `required` the SOD did **not** cover, in the order given.

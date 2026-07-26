@@ -397,7 +397,9 @@ fn unsupported_aa_key_is_not_reported_as_a_failed_check() {
     // one owed — `aa_unverifiable` is how it tells "unverified" from "absent".
     assert!(v.supports_active_auth());
     // Pre-branch behaviour restored: a genuine RSA-AA passport is not stamped
-    // inauthentic just because we cannot check its AA key.
+    // inauthentic just because we cannot check its AA key. This is the one
+    // missing AA result `is_genuine` forgives (E5) — an answer we could have
+    // checked and did not get is not forgiven.
     assert!(v.is_genuine(), "{:?}", v.notes);
 }
 
@@ -567,8 +569,10 @@ fn an_aa_key_that_is_not_the_one_the_sod_covers_is_ignored() {
         "{:?}",
         v.notes
     );
-    // The document owes a proof, and none of the material we could use answered it.
+    // The document owes a proof, and none of the material we could use answered
+    // it — so the headline verdict does not call it genuine.
     assert!(v.supports_active_auth());
+    assert!(!v.is_genuine(), "{:?}", v.notes);
 }
 
 /// The same shape for DG2: a SOD that covers DG1 only lets the caller invent a
@@ -643,6 +647,48 @@ fn a_sod_that_lists_dg15_reports_the_document_as_aa_capable() {
     assert_eq!(v.checked_dgs, vec![1, 2]);
     assert_eq!(v.sod_dgs, vec![1, 2, 15]);
     assert!(v.supports_active_auth());
+}
+
+/// THE FIX (E5): the headline verdict answers the question `supports_active_auth`
+/// asks. A cloned chip copies the SOD, DG1 and DG2 — all of which chain to a
+/// trusted CSCA — and simply omits the anti-clone proof it cannot produce. The
+/// verdict already knew better (`sod_dgs` lists 15, `checked_dgs` does not);
+/// now `is_genuine` says so instead of reading identically to a chip that really
+/// proved possession.
+#[test]
+fn an_owed_but_missing_aa_proof_is_not_genuine() {
+    let (p, _dg15, key) = synthetic_aa_passport();
+
+    // The clone sends everything except the challenge-response.
+    let mut cloned = p.dgs.clone();
+    cloned.remove(&15);
+    let v = verify_passport(&p.sod, &cloned, &[p.csca.clone()], None).unwrap();
+    // Passive Authentication is perfect, and the chain is trusted...
+    assert!(v.dg_integrity && v.sod_signature, "{:?}", v.notes);
+    assert_eq!(v.chain, ChainStatus::Trusted);
+    // ...but the document said it had an AA key, and no proof arrived.
+    assert!(v.supports_active_auth());
+    assert_eq!(v.active_auth, None);
+    assert!(!v.aa_unverifiable);
+    assert!(!v.is_genuine(), "{:?}", v.notes);
+
+    // Reading the DG15 itself changes nothing: the proof is the answer, not the key.
+    let v = verify_passport(&p.sod, &p.dgs, &[p.csca.clone()], None).unwrap();
+    assert_eq!(v.checked_dgs, vec![1, 2, 15]);
+    assert!(!v.is_genuine(), "{:?}", v.notes);
+
+    // The same document *with* its proof is genuine — nothing else changed.
+    let challenge = [0xC1u8; 8];
+    let sig = aa_sign(&key, "SHA-256", &challenge);
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca],
+        Some((&p.dgs[&15], &challenge, &sig)),
+    )
+    .unwrap();
+    assert_eq!(v.active_auth, Some(true), "{:?}", v.notes);
+    assert!(v.is_genuine(), "{:?}", v.notes);
 }
 
 /// The other side: a SOD with no DG15 belongs to a document that cannot do
