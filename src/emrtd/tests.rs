@@ -215,6 +215,91 @@ fn aa_result_flows_into_the_verdict() {
     assert!(!v.is_genuine());
 }
 
+// ---------------------------------------------------------------------------
+// Holes the enforcement work has to close (issue #1). These tests assert the
+// CURRENT, WRONG behaviour so the fixes visibly flip them. Every byte here is
+// synthetic (see `emrtd::fixtures`).
+//
+// H1: `verify_passport` only walks the DGs the SOD's LDSSecurityObject LISTS.
+//     A DG the caller supplies but the SOD never covered is silently ignored —
+//     not hashed, not in `checked_dgs`, no effect on `dg_integrity`.
+// H2: the AA gate is bypassable by omission — no AA material means
+//     `active_auth = None`, which nothing treats as a failure, even when the SOD
+//     itself says the document has an AA key.
+// ---------------------------------------------------------------------------
+
+/// A passport whose SOD covers DG1/DG2 and an AA key it never signed: the SOD
+/// lists no DG15, so today the attacker's own key answers the challenge and the
+/// verdict reads as a genuine anti-clone proof.
+#[test]
+fn hole_h1_dg15_absent_from_the_sod_is_currently_accepted() {
+    let p = fixtures::synthetic_passport();
+    // The SOD covers DG1 and DG2 only — no DG15 hash.
+    assert_eq!(p.dgs.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+
+    // Attacker-generated AA key + a signature over a challenge of their choosing.
+    let (attacker_dg15, attacker_key) = synthetic_aa_chip();
+    let challenge = [0x5au8, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a];
+    let sig = aa_sign(&attacker_key, "SHA-256", &challenge);
+
+    // The caller hands DG15 in alongside the genuine DGs, exactly as the backend
+    // does before calling us.
+    let mut dgs = p.dgs.clone();
+    dgs.insert(15, attacker_dg15.clone());
+
+    let v = verify_passport(&p.sod, &dgs, &[p.csca], Some((&attacker_dg15, &challenge, &sig)))
+        .unwrap();
+    // WRONG (today): the substituted key is never checked against the SOD, yet it
+    // is credited with a passing Active Authentication.
+    assert_eq!(v.active_auth, Some(true), "{:?}", v.notes);
+    assert!(v.dg_integrity, "{:?}", v.notes);
+    assert!(v.sod_signature, "{:?}", v.notes);
+    assert_eq!(v.chain, ChainStatus::Trusted);
+    // DG15 never entered the integrity check at all.
+    assert_eq!(v.checked_dgs, vec![1, 2]);
+    assert!(v.is_genuine(), "{:?}", v.notes);
+}
+
+/// The same shape for DG2: a SOD that covers DG1 only accepts any DG2 the caller
+/// invents. The backend hashes that DG2 into `portrait_hash` and discloses it as
+/// the `dg2` claim the face-verification issuer matches against.
+#[test]
+fn hole_h1_dg2_absent_from_the_sod_is_currently_accepted() {
+    let mut covered = BTreeMap::new();
+    covered.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    let p = fixtures::synthetic_passport_with_dgs(covered);
+
+    let mut dgs = p.dgs.clone();
+    dgs.insert(2, b"ATTACKER-CHOSEN-FACE-NOT-IN-THE-SOD".to_vec());
+
+    let v = verify_passport(&p.sod, &dgs, &[p.csca], None).unwrap();
+    // WRONG (today): an uncovered DG2 rides along as authentic.
+    assert!(v.dg_integrity, "{:?}", v.notes);
+    assert_eq!(v.checked_dgs, vec![1]);
+    assert!(v.is_genuine(), "{:?}", v.notes);
+}
+
+/// H2: the SOD lists a DG15, so this document supports Active Authentication —
+/// but simply omitting the AA material yields `active_auth = None`, which no gate
+/// treats as a failure.
+#[test]
+fn hole_h2_omitted_aa_on_an_aa_capable_sod_is_currently_accepted() {
+    let (dg15, _key) = synthetic_aa_chip();
+    let mut covered = BTreeMap::new();
+    covered.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    covered.insert(2u8, b"SYNTHETIC-DG2-NOT-A-REAL-FACE".to_vec());
+    covered.insert(15u8, dg15);
+    let p = fixtures::synthetic_passport_with_dgs(covered);
+
+    // The chip's DG15 is read and hashes correctly; no challenge is answered.
+    let v = verify_passport(&p.sod, &p.dgs, &[p.csca], None).unwrap();
+    assert!(v.dg_integrity, "{:?}", v.notes);
+    assert_eq!(v.checked_dgs, vec![1, 2, 15]);
+    // WRONG (today): AA was never proven, yet the document reads as genuine.
+    assert_eq!(v.active_auth, None);
+    assert!(v.is_genuine(), "{:?}", v.notes);
+}
+
 #[test]
 fn strips_sod_application_wrapper() {
     let inner = b"content-info-bytes";
