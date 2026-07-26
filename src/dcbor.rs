@@ -447,4 +447,41 @@ mod tests {
     /// sha256 (lowercase hex) of that encoding.
     const SHARED_VECTOR_SHA256: &str =
         "f71cb92f2b5321b3a0190f70fcc140072f04bec225c76ef7a8513a8b1b0fbac6";
+
+    /// The same envelope WITH the source-document section (spec §5.1 B): the
+    /// passport evidence named by content hash. This is the shape the DTC flow
+    /// produces today — EF.DG2 is reachable (the ePassport credential's
+    /// always-visible `portrait_hash`), EF.SOD and EF.DG1 are not, so they
+    /// encode as explicit CBOR nulls rather than being dropped.
+    fn belt_envelope_with_documents_fixture() -> serde_json::Value {
+        let mut env = belt_envelope_fixture();
+        env.as_object_mut().unwrap().insert(
+            "documents".into(),
+            json!([{
+                "type": "epassport",
+                "sod_hash": null,
+                "dg1_hash": null,
+                "dg2_hash": "d2"
+            }]),
+        );
+        env
+    }
+
+    #[test]
+    fn belt_envelope_with_documents_matches_the_shared_test_vector() {
+        let bytes = encode(&Cbor::from_json(&belt_envelope_with_documents_fixture()).unwrap())
+            .unwrap();
+        let digest = to_hex(&Sha256::digest(&bytes));
+
+        // Asserted identically by app/test/belt_bundle_test.dart against the
+        // Dart encoder ("canonicalCbor of the documented envelope …").
+        assert_eq!(bytes.len(), DOCUMENTED_VECTOR_LEN);
+        assert_eq!(digest, DOCUMENTED_VECTOR_SHA256);
+    }
+
+    /// Length in bytes of the encoding of the documented fixture.
+    const DOCUMENTED_VECTOR_LEN: usize = 799;
+    /// sha256 (lowercase hex) of that encoding.
+    const DOCUMENTED_VECTOR_SHA256: &str =
+        "f54101592b905e04233b9c31faf367ffba981aec687f9c6aeee281bbbf751e79";
 }
