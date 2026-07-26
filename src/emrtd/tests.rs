@@ -226,9 +226,10 @@ fn aa_result_flows_into_the_verdict() {
 //     LISTS. A DG the caller supplies but the SOD never covered is still
 //     silently ignored by `dg_integrity` — so `uncovered_dgs` now names it, and
 //     a caller that relies on that group refuses to issue.
-// H2: the AA gate is bypassable by omission — no AA material means
-//     `active_auth = None`, which nothing treats as a failure, even when the SOD
-//     itself says the document has an AA key.
+// H2 (closed): omitting the AA material still means `active_auth = None`, which
+//     on its own cannot be told apart from a chip with no AA key — so the verdict
+//     now also carries `sod_dgs`, and `supports_active_auth` says when the
+//     document had a key and therefore owed a proof.
 // ---------------------------------------------------------------------------
 
 /// A passport whose SOD covers DG1/DG2 and an AA key it never signed: the SOD
@@ -307,11 +308,14 @@ fn every_covered_dg_is_reported_as_covered() {
     assert_eq!(v.uncovered_dgs(&[3]), vec![3]);
 }
 
-/// H2: the SOD lists a DG15, so this document supports Active Authentication —
-/// but simply omitting the AA material yields `active_auth = None`, which no gate
-/// treats as a failure.
+/// THE FIX (H2): the SOD lists a DG15, so this document supports Active
+/// Authentication. Omitting the AA material still yields `active_auth = None` —
+/// indistinguishable, on that field alone, from a chip that has no AA key — so
+/// the verdict now also reports what the SOD claims, and `supports_active_auth`
+/// is what tells a caller a proof was owed. (The gate is the caller's: the
+/// backend refuses issuance in strict mode on exactly this.)
 #[test]
-fn hole_h2_omitted_aa_on_an_aa_capable_sod_is_currently_accepted() {
+fn a_sod_that_lists_dg15_reports_the_document_as_aa_capable() {
     let (dg15, _key) = synthetic_aa_chip();
     let mut covered = BTreeMap::new();
     covered.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
@@ -320,10 +324,32 @@ fn hole_h2_omitted_aa_on_an_aa_capable_sod_is_currently_accepted() {
     let p = fixtures::synthetic_passport_with_dgs(covered);
 
     // The chip's DG15 is read and hashes correctly; no challenge is answered.
-    let v = verify_passport(&p.sod, &p.dgs, &[p.csca], None).unwrap();
+    let v = verify_passport(&p.sod, &p.dgs, &[p.csca.clone()], None).unwrap();
     assert!(v.dg_integrity, "{:?}", v.notes);
     assert_eq!(v.checked_dgs, vec![1, 2, 15]);
-    // WRONG (today): AA was never proven, yet the document reads as genuine.
+    assert_eq!(v.active_auth, None);
+    // THE FIX: the document itself says it has an AA key, whatever was uploaded.
+    assert_eq!(v.sod_dgs, vec![1, 2, 15]);
+    assert!(v.supports_active_auth());
+
+    // The DG15 need not even be read for the SOD to say the key exists — this is
+    // the shape a client that drops the AA fields produces.
+    let mut without_dg15 = p.dgs.clone();
+    without_dg15.remove(&15);
+    let v = verify_passport(&p.sod, &without_dg15, &[p.csca], None).unwrap();
+    assert_eq!(v.checked_dgs, vec![1, 2]);
+    assert_eq!(v.sod_dgs, vec![1, 2, 15]);
+    assert!(v.supports_active_auth());
+}
+
+/// The other side: a SOD with no DG15 belongs to a document that cannot do
+/// Active Authentication at all, so a missing proof is not a missing answer.
+#[test]
+fn a_sod_without_dg15_reports_the_document_as_not_aa_capable() {
+    let p = fixtures::synthetic_passport();
+    let v = verify_passport(&p.sod, &p.dgs, &[p.csca], None).unwrap();
+    assert_eq!(v.sod_dgs, vec![1, 2]);
+    assert!(!v.supports_active_auth());
     assert_eq!(v.active_auth, None);
     assert!(v.is_genuine(), "{:?}", v.notes);
 }

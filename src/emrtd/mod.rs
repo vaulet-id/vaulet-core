@@ -42,6 +42,10 @@ pub struct PassportVerdict {
     pub hash_algo: String,
     /// DG numbers whose hash was checked.
     pub checked_dgs: Vec<u8>,
+    /// Every DG number the SOD's LDSSecurityObject lists — what the *document*
+    /// says it carries, independent of what the caller happened to read. A
+    /// number here but not in `checked_dgs` was simply not supplied.
+    pub sod_dgs: Vec<u8>,
     /// Human-readable notes (unsupported algorithm, etc.).
     pub notes: Vec<String>,
 }
@@ -72,6 +76,18 @@ impl PassportVerdict {
             .copied()
             .filter(|num| !self.checked_dgs.contains(num))
             .collect()
+    }
+
+    /// Whether the *document* supports Active Authentication, i.e. the SOD lists
+    /// a DG15 (the data group that carries the chip's AA public key).
+    ///
+    /// `active_auth` is `None` both when the chip has no AA key and when the
+    /// caller simply did not send the proof, so it cannot tell the two apart —
+    /// and "no proof" is what a cloned chip would send. The SOD can: a document
+    /// whose SOD lists DG15 has an AA key, so a caller that treats a missing
+    /// proof as acceptable must first check this and demand one.
+    pub fn supports_active_auth(&self) -> bool {
+        self.sod_dgs.contains(&15)
     }
 }
 
@@ -128,6 +144,7 @@ pub fn verify_passport(
         active_auth,
         hash_algo: lds.hash_algo.clone(),
         checked_dgs: checked,
+        sod_dgs: lds.hashes.keys().copied().collect(),
         notes,
     })
 }
