@@ -36,12 +36,27 @@ pub struct PassportVerdict {
     pub sod_signature: bool,
     /// DSC → CSCA chain result.
     pub chain: ChainStatus,
-    /// Active Authentication result; None when the chip has no AA key.
+    /// Active Authentication result. `Some(false)` means the chip answered the
+    /// challenge and the answer did not verify. `None` means the check did not
+    /// happen at all — no AA material was supplied, or the key type is one we
+    /// cannot verify (see `aa_unverifiable`).
     pub active_auth: Option<bool>,
+    /// AA material *was* supplied but its key type is not implemented (RSA
+    /// ISO/IEC 9796-2 DSS1) or its EC curve is one this verifier cannot parse
+    /// (named-OID brainpool, P-521), so the challenge-response was neither proved nor
+    /// disproved. `active_auth` is `None` in that case, exactly as for a chip
+    /// with no AA key at all; this flag is what tells the two apart, so a caller
+    /// that demands a proof can say "not verified" instead of "not supplied"
+    /// and never read the absence as success. The reason is also in `notes`.
+    pub aa_unverifiable: bool,
     /// The SOD digest algorithm (e.g. "SHA-256").
     pub hash_algo: String,
     /// DG numbers whose hash was checked.
     pub checked_dgs: Vec<u8>,
+    /// Every DG number the SOD's LDSSecurityObject lists — what the *document*
+    /// says it carries, independent of what the caller happened to read. A
+    /// number here but not in `checked_dgs` was simply not supplied.
+    pub sod_dgs: Vec<u8>,
     /// Human-readable notes (unsupported algorithm, etc.).
     pub notes: Vec<String>,
 }
@@ -54,6 +69,36 @@ impl PassportVerdict {
             && self.sod_signature
             && self.chain == ChainStatus::Trusted
             && self.active_auth != Some(false)
+    }
+
+    /// Which of `required` the SOD did **not** cover, in the order given.
+    ///
+    /// `dg_integrity` only speaks for the data groups the SOD's
+    /// LDSSecurityObject lists: one the caller supplied but the SOD never
+    /// covered is not hashed, does not appear in `checked_dgs`, and cannot make
+    /// integrity fail. So a caller that *relies* on a data group (builds claims
+    /// from it, hashes it, trusts a key it carries) must also require that the
+    /// group was actually covered — otherwise the bytes are attacker-chosen.
+    /// Which groups those are is the caller's business; the check lives here so
+    /// every caller asks the question the same way.
+    pub fn uncovered_dgs(&self, required: &[u8]) -> Vec<u8> {
+        required
+            .iter()
+            .copied()
+            .filter(|num| !self.checked_dgs.contains(num))
+            .collect()
+    }
+
+    /// Whether the *document* supports Active Authentication, i.e. the SOD lists
+    /// a DG15 (the data group that carries the chip's AA public key).
+    ///
+    /// `active_auth` is `None` both when the chip has no AA key and when the
+    /// caller simply did not send the proof, so it cannot tell the two apart —
+    /// and "no proof" is what a cloned chip would send. The SOD can: a document
+    /// whose SOD lists DG15 has an AA key, so a caller that treats a missing
+    /// proof as acceptable must first check this and demand one.
+    pub fn supports_active_auth(&self) -> bool {
+        self.sod_dgs.contains(&15)
     }
 }
 
@@ -92,24 +137,43 @@ pub fn verify_passport(
     }
     checked.sort_unstable();
 
-    // 2) SOD signature + 3) chain (staged — see verify_sod_signature).
+    // 2) SOD signature (verified against the DSC embedded in the SOD) +
+    //    3) the DSC → CSCA chain. Both are real checks; the chain can only reach
+    //    `Trusted` when the caller supplied an anchor for the issuing country.
     let (sod_signature, chain) = verify_sod_signature(ci, csca, &mut notes);
 
-    // 4) Active Authentication.
-    let active_auth = aa.map(|(dg15, challenge, sig)| {
-        verify_active_auth(dg15, challenge, sig).unwrap_or_else(|e| {
-            notes.push(format!("AA: {e}"));
-            false
-        })
-    });
+    // 4) Active Authentication. Only a chip that answered *and* answered wrongly
+    //    is `Some(false)`: a key type or curve we cannot verify is not evidence of
+    //    a clone, it is a gap in this verifier, and reporting it as a failed check
+    //    would stamp genuine RSA-AA and brainpool-AA passports as inauthentic.
+    let mut active_auth = None;
+    let mut aa_unverifiable = false;
+    if let Some((dg15, challenge, sig)) = aa {
+        match verify_active_auth(dg15, challenge, sig) {
+            Ok(AaCheck::Verified) => active_auth = Some(true),
+            Ok(AaCheck::Failed) => active_auth = Some(false),
+            Ok(AaCheck::Unsupported(why)) => {
+                aa_unverifiable = true;
+                notes.push(format!("AA not verified: {why}"));
+            }
+            // Malformed material (DG15 that is not an SPKI, unreadable signature):
+            // the chip's own answer is unusable, which is a failed check.
+            Err(e) => {
+                active_auth = Some(false);
+                notes.push(format!("AA: {e}"));
+            }
+        }
+    }
 
     Ok(PassportVerdict {
         dg_integrity,
         sod_signature,
         chain,
         active_auth,
+        aa_unverifiable,
         hash_algo: lds.hash_algo.clone(),
         checked_dgs: checked,
+        sod_dgs: lds.hashes.keys().copied().collect(),
         notes,
     })
 }
@@ -278,7 +342,7 @@ fn signed_data_econtent(ci: &[u8]) -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// SOD signature + chain, Active Authentication (staged — see notes)
+// SOD signature + chain, Active Authentication
 // ---------------------------------------------------------------------------
 
 const OID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
@@ -726,9 +790,235 @@ mod ecdsa_generic_tests {
     }
 }
 
-/// Verify the chip's Active Authentication signature over the challenge. Staged.
-fn verify_active_auth(_dg15: &[u8], _challenge: &[u8], _sig: &[u8]) -> Result<bool> {
-    Err(CoreError::Credential("AA verify staged".into()))
+// ---------------------------------------------------------------------------
+// Active Authentication (ICAO Doc 9303 Part 11 §6.1)
+// ---------------------------------------------------------------------------
+
+/// id-ecPublicKey — an AA key we can verify with ECDSA.
+const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+
+/// Digest algorithms tried for ECDSA-AA. The chip's choice is announced in
+/// DG14's ActiveAuthenticationInfo, which the reader does not pass us, so we
+/// accept the signature under any ICAO-permitted digest. Trying several is safe:
+/// a forged signature must still verify under the DG15 key, whose own hash is
+/// covered by the SOD.
+const AA_HASHES: [&str; 5] = ["SHA-256", "SHA-1", "SHA-224", "SHA-384", "SHA-512"];
+
+/// Strip the EF.DG15 file wrapper (`0x6F` tag) if present, returning the inner
+/// SubjectPublicKeyInfo DER. Readers hand us the whole EF, not the bare key.
+fn strip_dg15_wrapper(dg15: &[u8]) -> &[u8] {
+    if dg15.first() == Some(&0x6f) {
+        if let Ok(tlv) = read_tlv(dg15) {
+            return tlv.value;
+        }
+    }
+    dg15
+}
+
+/// The algorithm OID of a SubjectPublicKeyInfo (hand-rolled so SPKIs with
+/// explicit EC domain parameters parse the same as named-curve ones).
+fn spki_algorithm_oid(spki: &[u8]) -> Option<ObjectIdentifier> {
+    let outer = read_tlv(spki).ok()?; // SPKI SEQUENCE
+    if outer.tag != 0x30 {
+        return None;
+    }
+    let alg = read_tlv(outer.value).ok()?; // AlgorithmIdentifier SEQUENCE
+    if alg.tag != 0x30 {
+        return None;
+    }
+    let oid = read_tlv(alg.value).ok()?;
+    if oid.tag != 0x06 {
+        return None;
+    }
+    ObjectIdentifier::from_der(&der_tlv_bytes(0x06, oid.value)).ok()
+}
+
+/// Encode a non-negative integer as a DER INTEGER TLV.
+fn der_integer_bytes(v: &BigU) -> Vec<u8> {
+    let mut b = v.to_bytes_be();
+    if b.is_empty() {
+        b = vec![0];
+    }
+    if b[0] & 0x80 != 0 {
+        b.insert(0, 0);
+    }
+    der_tlv_bytes(0x02, &b)
+}
+
+/// Re-encode `(r, s)` as an X9.62 `SEQUENCE { r, s }` for the typed verifiers.
+fn der_ecdsa_sig_bytes(r: &BigU, s: &BigU) -> Vec<u8> {
+    let mut inner = der_integer_bytes(r);
+    inner.extend_from_slice(&der_integer_bytes(s));
+    der_tlv_bytes(0x30, &inner)
+}
+
+/// Candidate `(r, s)` readings of an AA signature. INTERNAL AUTHENTICATE returns
+/// the plain `r || s` concatenation, but some stacks hand back X9.62 DER, so we
+/// offer both readings and let verification decide.
+fn aa_ecdsa_sig_candidates(sig: &[u8]) -> Vec<(BigU, BigU)> {
+    let mut out = Vec::new();
+    if sig.first() == Some(&0x30) {
+        if let Some(rs) = parse_ecdsa_sig(sig) {
+            out.push(rs);
+        }
+    }
+    if !sig.is_empty() && sig.len() % 2 == 0 {
+        let half = sig.len() / 2;
+        out.push((
+            BigU::from_bytes_be(&sig[..half]),
+            BigU::from_bytes_be(&sig[half..]),
+        ));
+    }
+    out
+}
+
+/// Human-readable name for a named-curve OID, for the notes.
+fn ec_curve_name(oid: &ObjectIdentifier) -> Option<&'static str> {
+    Some(match oid.to_string().as_str() {
+        "1.2.840.10045.3.1.1" => "P-192",
+        "1.3.132.0.33" => "P-224",
+        "1.2.840.10045.3.1.7" => "P-256",
+        "1.3.132.0.34" => "P-384",
+        "1.3.132.0.35" => "P-521",
+        "1.3.132.0.10" => "secp256k1",
+        "1.3.36.3.3.2.8.1.1.1" => "brainpoolP160r1",
+        "1.3.36.3.3.2.8.1.1.3" => "brainpoolP192r1",
+        "1.3.36.3.3.2.8.1.1.5" => "brainpoolP224r1",
+        "1.3.36.3.3.2.8.1.1.7" => "brainpoolP256r1",
+        "1.3.36.3.3.2.8.1.1.9" => "brainpoolP320r1",
+        "1.3.36.3.3.2.8.1.1.11" => "brainpoolP384r1",
+        "1.3.36.3.3.2.8.1.1.13" => "brainpoolP512r1",
+        _ => return None,
+    })
+}
+
+/// Name the EC curve of a SubjectPublicKeyInfo for a note: the named curve if
+/// the parameters carry an OID, otherwise "explicit parameters" plus the SPKI
+/// hex, which is the only way to identify a curve we could not parse.
+fn ec_curve_label(spki: &[u8]) -> String {
+    let params = (|| {
+        let outer = read_tlv(spki).ok()?; // SPKI SEQUENCE
+        let alg = read_tlv(outer.value).ok()?; // AlgorithmIdentifier SEQUENCE
+        let oid = read_tlv(alg.value).ok()?; // id-ecPublicKey
+        read_tlv(oid.rest).ok().map(|p| (p.tag, p.value.to_vec()))
+    })();
+    if let Some((0x06, bytes)) = &params {
+        if let Ok(oid) = ObjectIdentifier::from_der(&der_tlv_bytes(0x06, bytes)) {
+            return match ec_curve_name(&oid) {
+                Some(name) => format!("{name} ({oid})"),
+                None => format!("named curve {oid}"),
+            };
+        }
+    }
+    let hex: String = spki.iter().map(|b| format!("{b:02x}")).collect();
+    format!("explicit parameters; spki={hex}")
+}
+
+/// Verify an ECDSA Active Authentication signature over the challenge.
+///
+/// A curve this verifier cannot parse yields `Unsupported`, never `Failed`:
+/// not being able to read the key says nothing about the chip's answer.
+fn verify_aa_ecdsa(spki: &[u8], challenge: &[u8], sig: &[u8]) -> Result<AaCheck> {
+    use ecdsa::signature::hazmat::PrehashVerifier;
+    use spki::DecodePublicKey;
+
+    let k256 = p256::ecdsa::VerifyingKey::from_public_key_der(spki).ok();
+    let k384 = p384::ecdsa::VerifyingKey::from_public_key_der(spki).ok();
+    let explicit = if k256.is_none() && k384.is_none() {
+        parse_ec_explicit_spki(spki)
+    } else {
+        None
+    };
+    if k256.is_none() && k384.is_none() && explicit.is_none() {
+        // A gap in this verifier, not a wrong answer from the chip.
+        return Ok(AaCheck::Unsupported(format!(
+            "unsupported ECDSA curve {}",
+            ec_curve_label(spki)
+        )));
+    }
+
+    let candidates = aa_ecdsa_sig_candidates(sig);
+    if candidates.is_empty() {
+        return Err(CoreError::Credential("AA: bad ECDSA signature".into()));
+    }
+
+    for algo in AA_HASHES {
+        let hashed = digest(algo, challenge);
+        for (r, s) in &candidates {
+            if let Some(vk) = &k256 {
+                if let Ok(s2) = p256::ecdsa::Signature::from_der(&der_ecdsa_sig_bytes(r, s)) {
+                    if vk.verify_prehash(&hashed, &s2).is_ok() {
+                        return Ok(AaCheck::Verified);
+                    }
+                }
+            }
+            if let Some(vk) = &k384 {
+                if let Ok(s2) = p384::ecdsa::Signature::from_der(&der_ecdsa_sig_bytes(r, s)) {
+                    if vk.verify_prehash(&hashed, &s2).is_ok() {
+                        return Ok(AaCheck::Verified);
+                    }
+                }
+            }
+            if let Some((p, a, n, gx, gy, qx, qy)) = &explicit {
+                // e = the leftmost bit_len(n) bits of the hash.
+                let mut e = BigU::from_bytes_be(&hashed);
+                let hbits = (hashed.len() * 8) as u64;
+                let nbits = n.bits();
+                if hbits > nbits {
+                    e >>= (hbits - nbits) as usize;
+                }
+                if ecdsa_verify_generic(p, a, n, gx, gy, qx, qy, &e, r, s) {
+                    return Ok(AaCheck::Verified);
+                }
+            }
+        }
+    }
+    // Parsed the key, tried every reading of the answer: the chip answered wrongly.
+    Ok(AaCheck::Failed)
+}
+
+/// The outcome of an Active Authentication check.
+///
+/// `Unsupported` is deliberately *not* an error and *not* `Failed`: "this
+/// verifier cannot check that key type" says nothing about the chip, whereas
+/// `Failed` accuses it of being a clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AaCheck {
+    /// The chip's signature over the challenge verified.
+    Verified,
+    /// The chip answered and the answer did not verify.
+    Failed,
+    /// The key type or curve is not implemented here; carries the reason for
+    /// the notes.
+    Unsupported(String),
+}
+
+/// Verify the chip's Active Authentication signature over the challenge.
+///
+/// `dg15` is EF.DG15 (with or without its `0x6F` file wrapper), carrying the AA
+/// public key as a SubjectPublicKeyInfo. ECDSA keys are verified with the same
+/// P-256/P-384/explicit-parameter dispatch used for the SOD; an EC curve that
+/// dispatch cannot parse (named-OID brainpool, P-521, secp256k1) reports
+/// `Unsupported` naming the curve, just as an unimplemented key type does. RSA
+/// AA uses ISO/IEC 9796-2 Digital Signature Scheme 1 with message recovery —
+/// not a PKCS#1 verify — and is not implemented yet; it reports `Unsupported`
+/// too. `verify_passport` surfaces `Unsupported` as `active_auth = None` +
+/// `aa_unverifiable` plus a note, never as a failed check.
+fn verify_active_auth(dg15: &[u8], challenge: &[u8], sig: &[u8]) -> Result<AaCheck> {
+    let spki = strip_dg15_wrapper(dg15);
+    let oid = spki_algorithm_oid(spki)
+        .ok_or_else(|| CoreError::Credential("AA: DG15 is not a SubjectPublicKeyInfo".into()))?;
+    if oid == OID_EC_PUBLIC_KEY {
+        return verify_aa_ecdsa(spki, challenge, sig);
+    }
+    if oid.to_string().starts_with("1.2.840.113549.1.1") {
+        return Ok(AaCheck::Unsupported(
+            "RSA DSS1 unsupported (ISO/IEC 9796-2 not implemented)".into(),
+        ));
+    }
+    Ok(AaCheck::Unsupported(format!(
+        "unsupported AA key type {oid}"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +1046,11 @@ fn hash_name(oid: &ObjectIdentifier) -> String {
     }
     .to_string()
 }
+
+/// Synthetic SOD/DSC/CSCA builders for tests (see `fixtures`). Enabled for this
+/// crate's own tests and, via the `test-fixtures` feature, for the backend's.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixtures;
 
 #[cfg(test)]
 mod tests;
