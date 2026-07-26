@@ -141,29 +141,44 @@ fn aa_ecdsa_signature_over_the_challenge_verifies() {
     let (dg15, key) = synthetic_aa_chip();
     let challenge = [0x01u8, 2, 3, 4, 5, 6, 7, 8];
     let sig = aa_sign(&key, "SHA-256", &challenge);
-    assert!(verify_active_auth(&dg15, &challenge, &sig).unwrap());
+    assert_eq!(
+        verify_active_auth(&dg15, &challenge, &sig).unwrap(),
+        AaCheck::Verified
+    );
 
     // The reader may hand us the bare SPKI instead of the whole EF.
     let spki = strip_dg15_wrapper(&dg15).to_vec();
-    assert!(verify_active_auth(&spki, &challenge, &sig).unwrap());
+    assert_eq!(
+        verify_active_auth(&spki, &challenge, &sig).unwrap(),
+        AaCheck::Verified
+    );
 
     // X9.62 DER is accepted alongside the raw r || s concatenation.
     let der_sig = der_ecdsa_sig_bytes(
         &BigU::from_bytes_be(&sig[..32]),
         &BigU::from_bytes_be(&sig[32..]),
     );
-    assert!(verify_active_auth(&dg15, &challenge, &der_sig).unwrap());
+    assert_eq!(
+        verify_active_auth(&dg15, &challenge, &der_sig).unwrap(),
+        AaCheck::Verified
+    );
 
     // A chip that hashed with SHA-1 still verifies (DG14 isn't passed to us).
     let sha1_sig = aa_sign(&key, "SHA-1", &challenge);
-    assert!(verify_active_auth(&dg15, &challenge, &sha1_sig).unwrap());
+    assert_eq!(
+        verify_active_auth(&dg15, &challenge, &sha1_sig).unwrap(),
+        AaCheck::Verified
+    );
 }
 
 #[test]
 fn aa_rejects_a_signature_over_another_challenge() {
     let (dg15, key) = synthetic_aa_chip();
     let sig = aa_sign(&key, "SHA-256", &[1u8, 2, 3, 4, 5, 6, 7, 8]);
-    assert!(!verify_active_auth(&dg15, &[9u8, 9, 9, 9, 9, 9, 9, 9], &sig).unwrap());
+    assert_eq!(
+        verify_active_auth(&dg15, &[9u8, 9, 9, 9, 9, 9, 9, 9], &sig).unwrap(),
+        AaCheck::Failed
+    );
 
     // A different chip's key must not validate this signature either.
     let (other_dg15, _) = {
@@ -172,21 +187,114 @@ fn aa_rejects_a_signature_over_another_challenge() {
         let spki = k.verifying_key().to_public_key_der().unwrap();
         (der_tlv_bytes(0x6f, spki.as_bytes()), k)
     };
-    assert!(!verify_active_auth(&other_dg15, &[1u8, 2, 3, 4, 5, 6, 7, 8], &sig).unwrap());
+    assert_eq!(
+        verify_active_auth(&other_dg15, &[1u8, 2, 3, 4, 5, 6, 7, 8], &sig).unwrap(),
+        AaCheck::Failed
+    );
 }
 
-#[test]
-fn aa_rsa_key_reports_unsupported() {
-    // rsaEncryption SPKI (the key bits are irrelevant — dispatch is by OID).
+/// An EF.DG15 carrying an rsaEncryption SubjectPublicKeyInfo. The key bits are
+/// irrelevant — dispatch is by algorithm OID, and RSA AA is never verified.
+fn rsa_aa_chip() -> Vec<u8> {
     let rsa_oid = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
     let mut alg = der_tlv_bytes(0x06, rsa_oid.as_bytes());
     alg.extend_from_slice(&der_tlv_bytes(0x05, &[])); // NULL parameters
     let mut spki = der_tlv_bytes(0x30, &alg);
     spki.extend_from_slice(&der_tlv_bytes(0x03, &[0x00, 0xde, 0xad]));
-    let dg15 = der_tlv_bytes(0x6f, &der_tlv_bytes(0x30, &spki));
+    der_tlv_bytes(0x6f, &der_tlv_bytes(0x30, &spki))
+}
 
-    let e = verify_active_auth(&dg15, &[0u8; 8], &[0u8; 8]).unwrap_err();
-    assert!(format!("{e}").contains("unsupported AA key type: RSA"), "{e}");
+/// RSA AA (ISO/IEC 9796-2 DSS1 with message recovery) is not implemented, and
+/// that is a gap in this verifier — not a failed challenge-response.
+#[test]
+fn aa_rsa_key_reports_unsupported() {
+    let dg15 = rsa_aa_chip();
+    let out = verify_active_auth(&dg15, &[0u8; 8], &[0u8; 8]).unwrap();
+    match out {
+        AaCheck::Unsupported(why) => assert!(why.contains("RSA DSS1 unsupported"), "{why}"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// Material we cannot parse at all is still a failed check: the chip's own
+/// answer is unusable, which is not the same as a key type we chose not to
+/// implement.
+#[test]
+fn aa_material_that_is_not_a_public_key_is_a_failed_check() {
+    let p = fixtures::synthetic_passport();
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca.clone()],
+        Some((b"not-an-spki", &[0u8; 8], &[0u8; 8])),
+    )
+    .unwrap();
+    assert_eq!(v.active_auth, Some(false), "{:?}", v.notes);
+    assert!(!v.aa_unverifiable, "{:?}", v.notes);
+    assert!(!v.is_genuine(), "{:?}", v.notes);
+}
+
+/// THE FIX (M1): an RSA AA key reaches the verdict as "not checked"
+/// (`active_auth = None` + `aa_unverifiable`), never as `Some(false)`. RSA AA
+/// keys are the majority of eMRTDs in the field; stamping them as a failed
+/// anti-clone check accused every genuine one of being a clone.
+#[test]
+fn unsupported_aa_key_is_not_reported_as_a_failed_check() {
+    let mut dgs = std::collections::BTreeMap::new();
+    dgs.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    dgs.insert(2u8, b"SYNTHETIC-DG2-NOT-A-REAL-FACE".to_vec());
+    dgs.insert(15u8, rsa_aa_chip());
+    let p = fixtures::synthetic_passport_with_dgs(dgs);
+
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca.clone()],
+        Some((&p.dgs[&15], &[0xA5u8; 8], &[0u8; 8])),
+    )
+    .unwrap();
+    // Not a failed challenge-response — the check simply did not happen.
+    assert_eq!(v.active_auth, None, "{:?}", v.notes);
+    assert!(v.aa_unverifiable, "{:?}", v.notes);
+    // ...and the reason is on the record rather than silently swallowed.
+    assert!(
+        v.notes.iter().any(|n| n.starts_with("AA not verified:")),
+        "{:?}",
+        v.notes
+    );
+    // Passive Authentication is untouched: the RSA DG15 is covered by the SOD.
+    assert!(v.dg_integrity && v.sod_signature, "{:?}", v.notes);
+    assert_eq!(v.checked_dgs, vec![1, 2, 15]);
+    // The document is AA-capable, so a caller that demands a proof still sees
+    // one owed — `aa_unverifiable` is how it tells "unverified" from "absent".
+    assert!(v.supports_active_auth());
+    // Pre-branch behaviour restored: a genuine RSA-AA passport is not stamped
+    // inauthentic just because we cannot check its AA key.
+    assert!(v.is_genuine(), "{:?}", v.notes);
+}
+
+/// The verified case, for contrast: an ECDSA AA key is checked for real, and
+/// `aa_unverifiable` stays false whether it passes or fails.
+#[test]
+fn a_supported_aa_key_is_always_verified_for_real() {
+    let p = fixtures::synthetic_passport();
+    let (dg15, key) = synthetic_aa_chip();
+    let challenge = [0x0au8, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
+    let sig = aa_sign(&key, "SHA-256", &challenge);
+
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca.clone()],
+        Some((&dg15, &challenge, &sig)),
+    )
+    .unwrap();
+    assert_eq!(v.active_auth, Some(true), "{:?}", v.notes);
+    assert!(!v.aa_unverifiable);
+
+    let v = verify_passport(&p.sod, &p.dgs, &[p.csca], Some((&dg15, &[0u8; 8], &sig))).unwrap();
+    assert_eq!(v.active_auth, Some(false), "{:?}", v.notes);
+    assert!(!v.aa_unverifiable);
 }
 
 /// The AA result reaching the verdict, on its own. Whether the SOD covered the

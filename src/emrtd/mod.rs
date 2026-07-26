@@ -36,8 +36,18 @@ pub struct PassportVerdict {
     pub sod_signature: bool,
     /// DSC → CSCA chain result.
     pub chain: ChainStatus,
-    /// Active Authentication result; None when the chip has no AA key.
+    /// Active Authentication result. `Some(false)` means the chip answered the
+    /// challenge and the answer did not verify. `None` means the check did not
+    /// happen at all — no AA material was supplied, or the key type is one we
+    /// cannot verify (see `aa_unverifiable`).
     pub active_auth: Option<bool>,
+    /// AA material *was* supplied but its key type is not implemented (RSA
+    /// ISO/IEC 9796-2 DSS1), so the challenge-response was neither proved nor
+    /// disproved. `active_auth` is `None` in that case, exactly as for a chip
+    /// with no AA key at all; this flag is what tells the two apart, so a caller
+    /// that demands a proof can say "not verified" instead of "not supplied"
+    /// and never read the absence as success. The reason is also in `notes`.
+    pub aa_unverifiable: bool,
     /// The SOD digest algorithm (e.g. "SHA-256").
     pub hash_algo: String,
     /// DG numbers whose hash was checked.
@@ -129,19 +139,35 @@ pub fn verify_passport(
     // 2) SOD signature + 3) chain (staged — see verify_sod_signature).
     let (sod_signature, chain) = verify_sod_signature(ci, csca, &mut notes);
 
-    // 4) Active Authentication.
-    let active_auth = aa.map(|(dg15, challenge, sig)| {
-        verify_active_auth(dg15, challenge, sig).unwrap_or_else(|e| {
-            notes.push(format!("AA: {e}"));
-            false
-        })
-    });
+    // 4) Active Authentication. Only a chip that answered *and* answered wrongly
+    //    is `Some(false)`: a key type we cannot verify is not evidence of a clone,
+    //    it is a gap in this verifier, and reporting it as a failed check would
+    //    stamp every genuine RSA-AA passport as inauthentic.
+    let mut active_auth = None;
+    let mut aa_unverifiable = false;
+    if let Some((dg15, challenge, sig)) = aa {
+        match verify_active_auth(dg15, challenge, sig) {
+            Ok(AaCheck::Verified) => active_auth = Some(true),
+            Ok(AaCheck::Failed) => active_auth = Some(false),
+            Ok(AaCheck::Unsupported(why)) => {
+                aa_unverifiable = true;
+                notes.push(format!("AA not verified: {why}"));
+            }
+            // Malformed material (DG15 that is not an SPKI, unreadable signature):
+            // the chip's own answer is unusable, which is a failed check.
+            Err(e) => {
+                active_auth = Some(false);
+                notes.push(format!("AA: {e}"));
+            }
+        }
+    }
 
     Ok(PassportVerdict {
         dg_integrity,
         sod_signature,
         chain,
         active_auth,
+        aa_unverifiable,
         hash_algo: lds.hash_algo.clone(),
         checked_dgs: checked,
         sod_dgs: lds.hashes.keys().copied().collect(),
@@ -901,27 +927,46 @@ fn verify_aa_ecdsa(spki: &[u8], challenge: &[u8], sig: &[u8]) -> Result<bool> {
     Ok(false)
 }
 
+/// The outcome of an Active Authentication check.
+///
+/// `Unsupported` is deliberately *not* an error and *not* `Failed`: "this
+/// verifier cannot check that key type" says nothing about the chip, whereas
+/// `Failed` accuses it of being a clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AaCheck {
+    /// The chip's signature over the challenge verified.
+    Verified,
+    /// The chip answered and the answer did not verify.
+    Failed,
+    /// The key type is not implemented here; carries the reason for the notes.
+    Unsupported(String),
+}
+
 /// Verify the chip's Active Authentication signature over the challenge.
 ///
 /// `dg15` is EF.DG15 (with or without its `0x6F` file wrapper), carrying the AA
 /// public key as a SubjectPublicKeyInfo. ECDSA keys are verified with the same
 /// P-256/P-384/explicit-parameter dispatch used for the SOD. RSA AA uses
 /// ISO/IEC 9796-2 Digital Signature Scheme 1 with message recovery — not a
-/// PKCS#1 verify — and is not implemented yet; it reports an error, which
-/// `verify_passport` surfaces as `active_auth = Some(false)` plus a note.
-fn verify_active_auth(dg15: &[u8], challenge: &[u8], sig: &[u8]) -> Result<bool> {
+/// PKCS#1 verify — and is not implemented yet; it reports `Unsupported`, which
+/// `verify_passport` surfaces as `active_auth = None` + `aa_unverifiable` plus a
+/// note, never as a failed check.
+fn verify_active_auth(dg15: &[u8], challenge: &[u8], sig: &[u8]) -> Result<AaCheck> {
     let spki = strip_dg15_wrapper(dg15);
     let oid = spki_algorithm_oid(spki)
         .ok_or_else(|| CoreError::Credential("AA: DG15 is not a SubjectPublicKeyInfo".into()))?;
     if oid == OID_EC_PUBLIC_KEY {
-        return verify_aa_ecdsa(spki, challenge, sig);
+        return Ok(match verify_aa_ecdsa(spki, challenge, sig)? {
+            true => AaCheck::Verified,
+            false => AaCheck::Failed,
+        });
     }
     if oid.to_string().starts_with("1.2.840.113549.1.1") {
-        return Err(CoreError::Credential(
-            "unsupported AA key type: RSA (ISO/IEC 9796-2 DSS1 not implemented)".into(),
+        return Ok(AaCheck::Unsupported(
+            "RSA DSS1 unsupported (ISO/IEC 9796-2 not implemented)".into(),
         ));
     }
-    Err(CoreError::Credential(format!(
+    Ok(AaCheck::Unsupported(format!(
         "unsupported AA key type {oid}"
     )))
 }
