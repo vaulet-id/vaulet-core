@@ -204,6 +204,116 @@ fn rsa_aa_chip() -> Vec<u8> {
     der_tlv_bytes(0x6f, &der_tlv_bytes(0x30, &spki))
 }
 
+/// An EF.DG15 carrying an id-ecPublicKey SubjectPublicKeyInfo on a *named*
+/// curve, given by OID. The point bytes are arbitrary — dispatch happens on the
+/// curve, before any point arithmetic.
+fn named_curve_aa_chip(curve_oid: &str, coord_len: usize) -> Vec<u8> {
+    let ec = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+    let curve = ObjectIdentifier::new(curve_oid).unwrap();
+    let mut alg = der_tlv_bytes(0x06, ec.as_bytes());
+    alg.extend_from_slice(&der_tlv_bytes(0x06, curve.as_bytes()));
+    let mut point = vec![0x00, 0x04]; // unused-bit count, then uncompressed point
+    point.extend(vec![0x11u8; coord_len]); // Qx
+    point.extend(vec![0x22u8; coord_len]); // Qy
+    let mut spki = der_tlv_bytes(0x30, &alg);
+    spki.extend_from_slice(&der_tlv_bytes(0x03, &point));
+    der_tlv_bytes(0x6f, &der_tlv_bytes(0x30, &spki))
+}
+
+/// THE FIX: an EC curve this verifier cannot parse is a gap here, exactly like
+/// an RSA AA key — `Unsupported`, naming the curve, never `Failed`. Reporting it
+/// as a failed check accused every genuine brainpool/P-521 chip of being a clone.
+#[test]
+fn aa_unsupported_ec_curve_reports_unsupported_naming_the_curve() {
+    // brainpoolP256r1 by OID (the named-curve form of Thailand's curve).
+    let dg15 = named_curve_aa_chip("1.3.36.3.3.2.8.1.1.7", 32);
+    match verify_active_auth(&dg15, &[0xA5u8; 8], &[0u8; 64]).unwrap() {
+        AaCheck::Unsupported(why) => {
+            assert!(why.contains("unsupported ECDSA curve"), "{why}");
+            assert!(why.contains("brainpoolP256r1"), "{why}");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+
+    // P-521 and secp256k1 are the same story.
+    let p521 = named_curve_aa_chip("1.3.132.0.35", 66);
+    match verify_active_auth(&p521, &[0xA5u8; 8], &[0u8; 64]).unwrap() {
+        AaCheck::Unsupported(why) => assert!(why.contains("P-521"), "{why}"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    let k256 = named_curve_aa_chip("1.3.132.0.10", 32);
+    match verify_active_auth(&k256, &[0xA5u8; 8], &[0u8; 64]).unwrap() {
+        AaCheck::Unsupported(why) => assert!(why.contains("secp256k1"), "{why}"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// ...and it reaches the verdict as "not checked", so a genuine passport on such
+/// a curve still issues instead of being stamped inauthentic.
+#[test]
+fn unsupported_ec_curve_is_not_reported_as_a_failed_check() {
+    let mut dgs = std::collections::BTreeMap::new();
+    dgs.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    dgs.insert(2u8, b"SYNTHETIC-DG2-NOT-A-REAL-FACE".to_vec());
+    dgs.insert(15u8, named_curve_aa_chip("1.3.36.3.3.2.8.1.1.7", 32));
+    let p = fixtures::synthetic_passport_with_dgs(dgs);
+
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca.clone()],
+        Some((&p.dgs[&15], &[0xA5u8; 8], &[0u8; 64])),
+    )
+    .unwrap();
+    assert_eq!(v.active_auth, None, "{:?}", v.notes);
+    assert!(v.aa_unverifiable, "{:?}", v.notes);
+    assert!(
+        v.notes
+            .iter()
+            .any(|n| n.starts_with("AA not verified:") && n.contains("brainpoolP256r1")),
+        "{:?}",
+        v.notes
+    );
+    // Passive Authentication is untouched, and the document still owes a proof.
+    assert!(v.dg_integrity && v.sod_signature, "{:?}", v.notes);
+    assert!(v.supports_active_auth());
+    assert!(v.is_genuine(), "{:?}", v.notes);
+}
+
+/// The other half of the split, pinned: a curve we *can* parse whose signature
+/// does not verify stays a failed check. "Cannot parse this curve" and "parsed
+/// fine, the answer was wrong" must never collapse into one another.
+#[test]
+fn a_wrong_signature_on_a_supported_curve_stays_a_failed_check() {
+    let (dg15, key) = synthetic_aa_chip();
+    let challenge = [0x0au8, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11];
+
+    // A well-formed ECDSA signature over a different challenge: the chip answered,
+    // and answered wrongly.
+    let replayed = aa_sign(&key, "SHA-256", &[0u8; 8]);
+    assert_eq!(
+        verify_active_auth(&dg15, &challenge, &replayed).unwrap(),
+        AaCheck::Failed
+    );
+
+    let mut dgs = std::collections::BTreeMap::new();
+    dgs.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    dgs.insert(2u8, b"SYNTHETIC-DG2-NOT-A-REAL-FACE".to_vec());
+    dgs.insert(15u8, dg15.clone());
+    let p = fixtures::synthetic_passport_with_dgs(dgs);
+
+    let v = verify_passport(
+        &p.sod,
+        &p.dgs,
+        &[p.csca.clone()],
+        Some((&dg15, &challenge, &replayed)),
+    )
+    .unwrap();
+    assert_eq!(v.active_auth, Some(false), "{:?}", v.notes);
+    assert!(!v.aa_unverifiable, "{:?}", v.notes);
+    assert!(!v.is_genuine(), "{:?}", v.notes);
+}
+
 /// RSA AA (ISO/IEC 9796-2 DSS1 with message recovery) is not implemented, and
 /// that is a gap in this verifier — not a failed challenge-response.
 #[test]

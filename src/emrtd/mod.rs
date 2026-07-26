@@ -42,7 +42,8 @@ pub struct PassportVerdict {
     /// cannot verify (see `aa_unverifiable`).
     pub active_auth: Option<bool>,
     /// AA material *was* supplied but its key type is not implemented (RSA
-    /// ISO/IEC 9796-2 DSS1), so the challenge-response was neither proved nor
+    /// ISO/IEC 9796-2 DSS1) or its EC curve is one this verifier cannot parse
+    /// (named-OID brainpool, P-521), so the challenge-response was neither proved nor
     /// disproved. `active_auth` is `None` in that case, exactly as for a chip
     /// with no AA key at all; this flag is what tells the two apart, so a caller
     /// that demands a proof can say "not verified" instead of "not supplied"
@@ -140,9 +141,9 @@ pub fn verify_passport(
     let (sod_signature, chain) = verify_sod_signature(ci, csca, &mut notes);
 
     // 4) Active Authentication. Only a chip that answered *and* answered wrongly
-    //    is `Some(false)`: a key type we cannot verify is not evidence of a clone,
-    //    it is a gap in this verifier, and reporting it as a failed check would
-    //    stamp every genuine RSA-AA passport as inauthentic.
+    //    is `Some(false)`: a key type or curve we cannot verify is not evidence of
+    //    a clone, it is a gap in this verifier, and reporting it as a failed check
+    //    would stamp genuine RSA-AA and brainpool-AA passports as inauthentic.
     let mut active_auth = None;
     let mut aa_unverifiable = false;
     if let Some((dg15, challenge, sig)) = aa {
@@ -869,8 +870,53 @@ fn aa_ecdsa_sig_candidates(sig: &[u8]) -> Vec<(BigU, BigU)> {
     out
 }
 
+/// Human-readable name for a named-curve OID, for the notes.
+fn ec_curve_name(oid: &ObjectIdentifier) -> Option<&'static str> {
+    Some(match oid.to_string().as_str() {
+        "1.2.840.10045.3.1.1" => "P-192",
+        "1.3.132.0.33" => "P-224",
+        "1.2.840.10045.3.1.7" => "P-256",
+        "1.3.132.0.34" => "P-384",
+        "1.3.132.0.35" => "P-521",
+        "1.3.132.0.10" => "secp256k1",
+        "1.3.36.3.3.2.8.1.1.1" => "brainpoolP160r1",
+        "1.3.36.3.3.2.8.1.1.3" => "brainpoolP192r1",
+        "1.3.36.3.3.2.8.1.1.5" => "brainpoolP224r1",
+        "1.3.36.3.3.2.8.1.1.7" => "brainpoolP256r1",
+        "1.3.36.3.3.2.8.1.1.9" => "brainpoolP320r1",
+        "1.3.36.3.3.2.8.1.1.11" => "brainpoolP384r1",
+        "1.3.36.3.3.2.8.1.1.13" => "brainpoolP512r1",
+        _ => return None,
+    })
+}
+
+/// Name the EC curve of a SubjectPublicKeyInfo for a note: the named curve if
+/// the parameters carry an OID, otherwise "explicit parameters" plus the SPKI
+/// hex, which is the only way to identify a curve we could not parse.
+fn ec_curve_label(spki: &[u8]) -> String {
+    let params = (|| {
+        let outer = read_tlv(spki).ok()?; // SPKI SEQUENCE
+        let alg = read_tlv(outer.value).ok()?; // AlgorithmIdentifier SEQUENCE
+        let oid = read_tlv(alg.value).ok()?; // id-ecPublicKey
+        read_tlv(oid.rest).ok().map(|p| (p.tag, p.value.to_vec()))
+    })();
+    if let Some((0x06, bytes)) = &params {
+        if let Ok(oid) = ObjectIdentifier::from_der(&der_tlv_bytes(0x06, bytes)) {
+            return match ec_curve_name(&oid) {
+                Some(name) => format!("{name} ({oid})"),
+                None => format!("named curve {oid}"),
+            };
+        }
+    }
+    let hex: String = spki.iter().map(|b| format!("{b:02x}")).collect();
+    format!("explicit parameters; spki={hex}")
+}
+
 /// Verify an ECDSA Active Authentication signature over the challenge.
-fn verify_aa_ecdsa(spki: &[u8], challenge: &[u8], sig: &[u8]) -> Result<bool> {
+///
+/// A curve this verifier cannot parse yields `Unsupported`, never `Failed`:
+/// not being able to read the key says nothing about the chip's answer.
+fn verify_aa_ecdsa(spki: &[u8], challenge: &[u8], sig: &[u8]) -> Result<AaCheck> {
     use ecdsa::signature::hazmat::PrehashVerifier;
     use spki::DecodePublicKey;
 
@@ -882,9 +928,10 @@ fn verify_aa_ecdsa(spki: &[u8], challenge: &[u8], sig: &[u8]) -> Result<bool> {
         None
     };
     if k256.is_none() && k384.is_none() && explicit.is_none() {
-        let hex: String = spki.iter().map(|b| format!("{b:02x}")).collect();
-        return Err(CoreError::Credential(format!(
-            "AA: unsupported ECDSA curve; spki={hex}"
+        // A gap in this verifier, not a wrong answer from the chip.
+        return Ok(AaCheck::Unsupported(format!(
+            "unsupported ECDSA curve {}",
+            ec_curve_label(spki)
         )));
     }
 
@@ -899,14 +946,14 @@ fn verify_aa_ecdsa(spki: &[u8], challenge: &[u8], sig: &[u8]) -> Result<bool> {
             if let Some(vk) = &k256 {
                 if let Ok(s2) = p256::ecdsa::Signature::from_der(&der_ecdsa_sig_bytes(r, s)) {
                     if vk.verify_prehash(&hashed, &s2).is_ok() {
-                        return Ok(true);
+                        return Ok(AaCheck::Verified);
                     }
                 }
             }
             if let Some(vk) = &k384 {
                 if let Ok(s2) = p384::ecdsa::Signature::from_der(&der_ecdsa_sig_bytes(r, s)) {
                     if vk.verify_prehash(&hashed, &s2).is_ok() {
-                        return Ok(true);
+                        return Ok(AaCheck::Verified);
                     }
                 }
             }
@@ -919,12 +966,13 @@ fn verify_aa_ecdsa(spki: &[u8], challenge: &[u8], sig: &[u8]) -> Result<bool> {
                     e >>= (hbits - nbits) as usize;
                 }
                 if ecdsa_verify_generic(p, a, n, gx, gy, qx, qy, &e, r, s) {
-                    return Ok(true);
+                    return Ok(AaCheck::Verified);
                 }
             }
         }
     }
-    Ok(false)
+    // Parsed the key, tried every reading of the answer: the chip answered wrongly.
+    Ok(AaCheck::Failed)
 }
 
 /// The outcome of an Active Authentication check.
@@ -938,7 +986,8 @@ enum AaCheck {
     Verified,
     /// The chip answered and the answer did not verify.
     Failed,
-    /// The key type is not implemented here; carries the reason for the notes.
+    /// The key type or curve is not implemented here; carries the reason for
+    /// the notes.
     Unsupported(String),
 }
 
@@ -946,20 +995,19 @@ enum AaCheck {
 ///
 /// `dg15` is EF.DG15 (with or without its `0x6F` file wrapper), carrying the AA
 /// public key as a SubjectPublicKeyInfo. ECDSA keys are verified with the same
-/// P-256/P-384/explicit-parameter dispatch used for the SOD. RSA AA uses
-/// ISO/IEC 9796-2 Digital Signature Scheme 1 with message recovery — not a
-/// PKCS#1 verify — and is not implemented yet; it reports `Unsupported`, which
-/// `verify_passport` surfaces as `active_auth = None` + `aa_unverifiable` plus a
-/// note, never as a failed check.
+/// P-256/P-384/explicit-parameter dispatch used for the SOD; an EC curve that
+/// dispatch cannot parse (named-OID brainpool, P-521, secp256k1) reports
+/// `Unsupported` naming the curve, just as an unimplemented key type does. RSA
+/// AA uses ISO/IEC 9796-2 Digital Signature Scheme 1 with message recovery —
+/// not a PKCS#1 verify — and is not implemented yet; it reports `Unsupported`
+/// too. `verify_passport` surfaces `Unsupported` as `active_auth = None` +
+/// `aa_unverifiable` plus a note, never as a failed check.
 fn verify_active_auth(dg15: &[u8], challenge: &[u8], sig: &[u8]) -> Result<AaCheck> {
     let spki = strip_dg15_wrapper(dg15);
     let oid = spki_algorithm_oid(spki)
         .ok_or_else(|| CoreError::Credential("AA: DG15 is not a SubjectPublicKeyInfo".into()))?;
     if oid == OID_EC_PUBLIC_KEY {
-        return Ok(match verify_aa_ecdsa(spki, challenge, sig)? {
-            true => AaCheck::Verified,
-            false => AaCheck::Failed,
-        });
+        return verify_aa_ecdsa(spki, challenge, sig);
     }
     if oid.to_string().starts_with("1.2.840.113549.1.1") {
         return Ok(AaCheck::Unsupported(
