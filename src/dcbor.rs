@@ -1,14 +1,12 @@
 //! Deterministic CBOR — the frozen `belt_v1` canonicalization (RFC 8949 §4.2).
 //!
-//! The liveness belt bundle is hashed today with canonical JSON (see
-//! `app/lib/features/liveness_belt/belt_bundle.dart`). The frozen belt_v1 wire
-//! format is deterministic CBOR, and this module is the Rust half of it. Its
-//! Dart twin is `app/lib/features/liveness_belt/dcbor.dart`; the two are pinned
-//! against the same test vectors so a bundle hashed on device recomputes to the
-//! same bytes on the server.
-//!
-//! Nothing switches over in this module: it is added alongside the JSON path so
-//! both ends can be proven byte-identical before `belt_version` moves.
+//! This is how the liveness belt bundle is hashed (see
+//! `app/lib/features/liveness_belt/belt_bundle.dart`), and this module is the
+//! Rust half of it. Its Dart twin is
+//! `app/lib/features/liveness_belt/dcbor.dart`; the two are pinned against the
+//! same test vectors so a bundle hashed on device recomputes to the same bytes
+//! on the server (`backend/src/belt_envelope.rs` is the typed envelope that
+//! feeds this encoder at `/api/v1/liveness/verify`).
 //!
 //! Encoding rules (RFC 8949 §4.2.1, "core deterministic"):
 //!   * definite-length encoding for every string, array and map;
