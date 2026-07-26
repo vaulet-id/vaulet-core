@@ -5,6 +5,7 @@
 //! The same crate is reused by the backend (axum) and, later, WASM.
 
 pub mod credential;
+pub mod dcbor;
 pub mod did;
 pub mod emrtd;
 pub mod keys;
@@ -209,15 +210,22 @@ pub fn wallet_recover_from_shares(shares: &[String]) -> Result<String> {
 /// (the `aud`) over the token response `c_nonce`, embedding the holder public
 /// JWK inline for the issuer to copy into `cnf.jwk`. Network-free; `iat` is Unix
 /// seconds from the caller.
+///
+/// `cb` is the channel-binding token the server issued with the session, echoed
+/// back as the `cb` claim (liveness-pad-spec §5.1 E). Pass `None` where the
+/// server issued none: the JWT is then exactly the one this call produced before
+/// the parameter existed.
 pub fn wallet_build_proof_jwt(
     secret: &str,
     issuer: &str,
     c_nonce: &str,
     iat: i64,
+    cb: Option<&str>,
 ) -> Result<String> {
     let key = load_secret_key(secret)?;
     let holder_jwk = key.public_jwk()?;
-    let proof = protocol::oid4vci::holder_proof(issuer, c_nonce, iat, holder_jwk, &key)?;
+    let proof =
+        protocol::oid4vci::holder_proof_bound(issuer, c_nonce, iat, cb, holder_jwk, &key)?;
     Ok(proof.jwt)
 }
 

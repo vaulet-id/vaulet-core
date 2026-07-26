@@ -293,6 +293,15 @@ pub mod oid4vci {
         pub iat: i64,
         /// The `c_nonce` from the token response.
         pub nonce: String,
+        /// Channel-binding token (liveness-pad-spec §5.1 E): the per-session
+        /// value the server issued alongside the nonce, echoed back inside the
+        /// signature so the server can tell the proof was made for the session
+        /// it handed the token to, rather than relayed in from another one.
+        ///
+        /// `None` — and omitted from the JWT entirely — for the flows that were
+        /// never issued one, so those proofs stay byte-identical to before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cb: Option<String>,
     }
 
     /// Assemble and ES256-sign a holder proof JWT (OID4VCI §F.1) with
@@ -329,12 +338,27 @@ pub mod oid4vci {
         holder_jwk: Value,
         holder_key: &SoftwareKey,
     ) -> Result<Proof> {
+        holder_proof_bound(issuer, c_nonce, iat, None, holder_jwk, holder_key)
+    }
+
+    /// Same as [`holder_proof`], additionally echoing the server's
+    /// channel-binding token as the `cb` claim (liveness-pad-spec §5.1 E).
+    /// `cb: None` produces exactly the JWT [`holder_proof`] produces.
+    pub fn holder_proof_bound(
+        issuer: &str,
+        c_nonce: &str,
+        iat: i64,
+        cb: Option<&str>,
+        holder_jwk: Value,
+        holder_key: &SoftwareKey,
+    ) -> Result<Proof> {
         let header = ProofJwtHeader::es256_jwk(holder_jwk);
         let claims = ProofJwtClaims {
             iss: None,
             aud: issuer.to_string(),
             iat,
             nonce: c_nonce.to_string(),
+            cb: cb.map(|s| s.to_string()),
         };
         Ok(Proof::jwt(build_proof_jwt(&header, &claims, holder_key)?))
     }
@@ -541,6 +565,48 @@ pub mod oid4vci {
             assert_eq!(claims.aud, "https://issuer.example");
             assert_eq!(claims.nonce, "nonce-xyz");
             assert_eq!(claims.iat, 1_700_000_000);
+            // No channel-binding token was issued, so the claim is absent.
+            assert_eq!(claims.cb, None);
+        }
+
+        /// The `cb` claim is carried inside the signature when the server issued
+        /// a channel-binding token, and the payload is unchanged when it did
+        /// not — the two calls must not differ for `cb: None`.
+        #[test]
+        fn proof_jwt_carries_the_channel_binding_token() {
+            let holder = SoftwareKey::generate();
+            let jwk = holder.public_jwk().unwrap();
+            let bound = holder_proof_bound(
+                "https://issuer.example",
+                "nonce-xyz",
+                1_700_000_000,
+                Some("cb-token-1"),
+                jwk.clone(),
+                &holder,
+            )
+            .unwrap();
+            let (_, claims) = decode_proof_jwt(&bound.jwt).unwrap();
+            assert_eq!(claims.cb.as_deref(), Some("cb-token-1"));
+
+            let plain = holder_proof(
+                "https://issuer.example",
+                "nonce-xyz",
+                1_700_000_000,
+                jwk.clone(),
+                &holder,
+            )
+            .unwrap();
+            let unbound = holder_proof_bound(
+                "https://issuer.example",
+                "nonce-xyz",
+                1_700_000_000,
+                None,
+                jwk,
+                &holder,
+            )
+            .unwrap();
+            let payload = |jwt: &str| jwt.split('.').nth(1).unwrap().to_string();
+            assert_eq!(payload(&plain.jwt), payload(&unbound.jwt));
         }
 
         #[test]
