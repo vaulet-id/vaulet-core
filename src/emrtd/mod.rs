@@ -465,15 +465,22 @@ fn verify_signature(
                 .map_err(|e| bad(format!("ECDSA sig: {e}")))?;
             return Ok(vk.verify_prehash(&hashed, &s).is_ok());
         }
-        // Unknown curve (named OID we don't support, or explicit domain params).
-        // Dump the SPKI so the exact curve/encoding can be identified offline.
-        let curve = spki::SubjectPublicKeyInfoRef::try_from(spki_der)
-            .ok()
-            .and_then(|s| s.algorithm.parameters_oid().ok())
-            .map(|o| o.to_string())
-            .unwrap_or_else(|| "explicit-or-unknown".into());
+        // Explicit domain parameters (brainpool in Thai passports, etc.): the
+        // NIST crates can't parse these, so verify generically with bignum.
+        if let (Some((p, a, n, gx, gy, qx, qy)), Some((r, s))) =
+            (parse_ec_explicit_spki(spki_der), parse_ecdsa_sig(sig))
+        {
+            // e = the leftmost bit_len(n) bits of the hash.
+            let mut e = num_bigint::BigUint::from_bytes_be(&hashed);
+            let hbits = (hashed.len() * 8) as u64;
+            let nbits = n.bits();
+            if hbits > nbits {
+                e >>= (hbits - nbits) as usize;
+            }
+            return Ok(ecdsa_verify_generic(&p, &a, &n, &gx, &gy, &qx, &qy, &e, &r, &s));
+        }
         let hex: String = spki_der.iter().map(|b| format!("{b:02x}")).collect();
-        return Err(bad(format!("unsupported ECDSA curve {curve}; spki={hex}")));
+        return Err(bad(format!("unsupported ECDSA curve; spki={hex}")));
     }
 
     // RSA: rsaEncryption / sha*WithRSAEncryption (PKCS#1 v1.5) or RSASSA-PSS.
@@ -503,6 +510,220 @@ fn verify_signature(
     }
 
     Err(bad(format!("unsupported signature algorithm {oid}")))
+}
+
+// --- Generic ECDSA over explicit Weierstrass domain parameters ---------------
+// Passports (e.g. Thailand's, brainpoolP256r1) embed the full curve in the DSC
+// rather than a named-curve OID; the NIST-specific crates can't parse those and
+// RustCrypto has no stable brainpool curve. We verify with big-integer math.
+// Verification touches only public data — no key material, no timing surface.
+
+type BigU = num_bigint::BigUint;
+
+/// Parse a SubjectPublicKeyInfo with **explicit** EC parameters, returning
+/// (prime p, curve a, order n, Gx, Gy, Qx, Qy). Reuses the module `read_tlv`.
+#[allow(clippy::type_complexity)]
+fn parse_ec_explicit_spki(spki: &[u8]) -> Option<(BigU, BigU, BigU, BigU, BigU, BigU, BigU)> {
+    let outer = read_tlv(spki).ok()?; // SPKI SEQUENCE
+    let alg = read_tlv(outer.value).ok()?; // algorithm SEQUENCE
+    let bitstr = read_tlv(alg.rest).ok()?; // subjectPublicKey BIT STRING
+    if bitstr.tag != 0x03 {
+        return None;
+    }
+    let oid = read_tlv(alg.value).ok()?; // id-ecPublicKey
+    let ecparams = read_tlv(oid.rest).ok()?; // ECParameters
+    if ecparams.tag != 0x30 {
+        return None; // named-curve (OID) params handled elsewhere
+    }
+    let ver = read_tlv(ecparams.value).ok()?;
+    let fieldid = read_tlv(ver.rest).ok()?; // SEQUENCE { OID, prime INTEGER }
+    let curve = read_tlv(fieldid.rest).ok()?; // SEQUENCE { a OCTET, b OCTET, [seed] }
+    let base = read_tlv(curve.rest).ok()?; // OCTET STRING 04||Gx||Gy
+    let order = read_tlv(base.rest).ok()?; // INTEGER n
+
+    let ft = read_tlv(fieldid.value).ok()?;
+    let prime = read_tlv(ft.rest).ok()?;
+    let a_oct = read_tlv(curve.value).ok()?;
+
+    if base.value.first() != Some(&0x04) {
+        return None;
+    }
+    let clen = (base.value.len() - 1) / 2;
+    let gx = BigU::from_bytes_be(&base.value[1..1 + clen]);
+    let gy = BigU::from_bytes_be(&base.value[1 + clen..]);
+
+    // BIT STRING: first byte is the unused-bit count (0), then 04||Qx||Qy.
+    let pk = bitstr.value.get(1..)?;
+    if pk.first() != Some(&0x04) {
+        return None;
+    }
+    let qlen = (pk.len() - 1) / 2;
+    let qx = BigU::from_bytes_be(&pk[1..1 + qlen]);
+    let qy = BigU::from_bytes_be(&pk[1 + qlen..]);
+
+    Some((
+        BigU::from_bytes_be(prime.value),
+        BigU::from_bytes_be(a_oct.value),
+        BigU::from_bytes_be(order.value),
+        gx,
+        gy,
+        qx,
+        qy,
+    ))
+}
+
+/// Parse an X9.62 ECDSA signature `SEQUENCE { r INTEGER, s INTEGER }`.
+fn parse_ecdsa_sig(sig: &[u8]) -> Option<(BigU, BigU)> {
+    let seq = read_tlv(sig).ok()?;
+    if seq.tag != 0x30 {
+        return None;
+    }
+    let r = read_tlv(seq.value).ok()?;
+    let s = read_tlv(r.rest).ok()?;
+    Some((BigU::from_bytes_be(r.value), BigU::from_bytes_be(s.value)))
+}
+
+/// `a - b (mod p)` for non-negative values.
+fn mod_sub(a: &BigU, b: &BigU, p: &BigU) -> BigU {
+    let a = a % p;
+    let b = b % p;
+    if a >= b {
+        (a - b) % p
+    } else {
+        (a + p - b) % p
+    }
+}
+
+/// Modular inverse via Fermat's little theorem (`p` is a prime field modulus).
+fn mod_inv(a: &BigU, p: &BigU) -> BigU {
+    a.modpow(&(p - 2u32), p)
+}
+
+type Pt = Option<(BigU, BigU)>; // None = point at infinity
+
+/// Affine point addition/doubling on `y² = x³ + a·x + b (mod p)`.
+fn pt_add(p1: &Pt, p2: &Pt, a: &BigU, p: &BigU) -> Pt {
+    match (p1, p2) {
+        (None, _) => p2.clone(),
+        (_, None) => p1.clone(),
+        (Some((x1, y1)), Some((x2, y2))) => {
+            let two = BigU::from(2u32);
+            if x1 == x2 {
+                if (y1 + y2) % p == BigU::from(0u32) {
+                    return None; // P + (−P)
+                }
+                // doubling
+                let three = BigU::from(3u32);
+                let num = (&three * x1 * x1 + a) % p;
+                let den = mod_inv(&((&two * y1) % p), p);
+                let lam = (num * den) % p;
+                let x3 = mod_sub(&((&lam * &lam) % p), &((&two * x1) % p), p);
+                let y3 = mod_sub(&((&lam * mod_sub(x1, &x3, p)) % p), y1, p);
+                Some((x3, y3))
+            } else {
+                let num = mod_sub(y2, y1, p);
+                let den = mod_inv(&mod_sub(x2, x1, p), p);
+                let lam = (num * den) % p;
+                let x3 = mod_sub(&mod_sub(&((&lam * &lam) % p), x1, p), x2, p);
+                let y3 = mod_sub(&((&lam * mod_sub(x1, &x3, p)) % p), y1, p);
+                Some((x3, y3))
+            }
+        }
+    }
+}
+
+/// `k·P` by double-and-add.
+fn pt_mul(k: &BigU, base: &Pt, a: &BigU, p: &BigU) -> Pt {
+    let mut result: Pt = None;
+    let mut addend = base.clone();
+    let mut kk = k.clone();
+    let one = BigU::from(1u32);
+    let zero = BigU::from(0u32);
+    while kk > zero {
+        if (&kk & &one) == one {
+            result = pt_add(&result, &addend, a, p);
+        }
+        addend = pt_add(&addend, &addend, a, p);
+        kk >>= 1u32;
+    }
+    result
+}
+
+/// ECDSA verification with explicit parameters.
+#[allow(clippy::too_many_arguments)]
+fn ecdsa_verify_generic(
+    p: &BigU,
+    a: &BigU,
+    n: &BigU,
+    gx: &BigU,
+    gy: &BigU,
+    qx: &BigU,
+    qy: &BigU,
+    e: &BigU,
+    r: &BigU,
+    s: &BigU,
+) -> bool {
+    let zero = BigU::from(0u32);
+    if r <= &zero || r >= n || s <= &zero || s >= n {
+        return false;
+    }
+    let w = mod_inv(s, n);
+    let u1 = (e * &w) % n;
+    let u2 = (r * &w) % n;
+    let g: Pt = Some((gx.clone(), gy.clone()));
+    let q: Pt = Some((qx.clone(), qy.clone()));
+    let point = pt_add(&pt_mul(&u1, &g, a, p), &pt_mul(&u2, &q, a, p), a, p);
+    match point {
+        None => false,
+        Some((x, _)) => (x % n) == *r,
+    }
+}
+
+#[cfg(test)]
+mod ecdsa_generic_tests {
+    use super::*;
+
+    fn hx(s: &[u8]) -> BigU {
+        BigU::parse_bytes(s, 16).unwrap()
+    }
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // brainpoolP256r1 (RFC 5639).
+    #[test]
+    fn order_times_generator_is_infinity() {
+        let p = hx(b"A9FB57DBA1EEA9BC3E660A909D838D726E3BF623D52620282013481D1F6E5377");
+        let a = hx(b"7D5A0975FC2C3057EEF67530417AFFE7FB8055C126DC5C6CE94A4B44F330B5D9");
+        let n = hx(b"A9FB57DBA1EEA9BC3E660A909D838D718C397AA3B561A6F7901E0E82974856A7");
+        let gx = hx(b"8BD2AEB9CB7E57CB2C4B482FFC81B7AFB9DE27E1E3BD23C23A4453BD9ACE3262");
+        let gy = hx(b"547EF835C3DAC4FD97F8461A14611DC9C27745132DED8E545C1D54C72F046997");
+        let g = Some((gx, gy));
+        // n·G must be the point at infinity — validates pt_add (add + double) and pt_mul.
+        assert!(pt_mul(&n, &g, &a, &p).is_none());
+    }
+
+    // The real Thai passport DSC SPKI (explicit brainpoolP256r1 params).
+    #[test]
+    fn parses_explicit_brainpool_spki() {
+        let spki = unhex("308201333081ec06072a8648ce3d02013081e0020101302c06072a8648ce3d0101022100a9fb57dba1eea9bc3e660a909d838d726e3bf623d52620282013481d1f6e5377304404207d5a0975fc2c3057eef67530417affe7fb8055c126dc5c6ce94a4b44f330b5d9042026dc5c6ce94a4b44f330b5d9bbd77cbf958416295cf7e1ce6bccdc18ff8c07b60441048bd2aeb9cb7e57cb2c4b482ffc81b7afb9de27e1e3bd23c23a4453bd9ace3262547ef835c3dac4fd97f8461a14611dc9c27745132ded8e545c1d54c72f046997022100a9fb57dba1eea9bc3e660a909d838d718c397aa3b561a6f7901e0e82974856a702010103420004648cad39a585841d16d98cb2cf0d1a4dd0d987ec709630182fcd6970149e3c5d1dc215968bf364048146cb44ea6510bd0dc05036f98b6d0434c00cba6ff406dc");
+        let (p, a, n, gx, gy, qx, qy) = parse_ec_explicit_spki(&spki).unwrap();
+        assert_eq!(p, hx(b"A9FB57DBA1EEA9BC3E660A909D838D726E3BF623D52620282013481D1F6E5377"));
+        assert_eq!(a, hx(b"7D5A0975FC2C3057EEF67530417AFFE7FB8055C126DC5C6CE94A4B44F330B5D9"));
+        assert_eq!(n, hx(b"A9FB57DBA1EEA9BC3E660A909D838D718C397AA3B561A6F7901E0E82974856A7"));
+        assert_eq!(gx, hx(b"8BD2AEB9CB7E57CB2C4B482FFC81B7AFB9DE27E1E3BD23C23A4453BD9ACE3262"));
+        // Public key point.
+        assert_eq!(qx, hx(b"648CAD39A585841D16D98CB2CF0D1A4DD0D987EC709630182FCD6970149E3C5D"));
+        assert_eq!(qy, hx(b"1DC215968BF364048146CB44EA6510BD0DC05036F98B6D0434C00CBA6FF406DC"));
+        // Q must lie on the curve: y² == x³ + a·x + b (mod p).  b from the SPKI.
+        let b = hx(b"26DC5C6CE94A4B44F330B5D9BBD77CBF958416295CF7E1CE6BCCDC18FF8C07B6");
+        let lhs = (&qy * &qy) % &p;
+        let rhs = (&qx * &qx % &p * &qx + &a * &qx + &b) % &p;
+        assert_eq!(lhs, rhs, "public key not on curve");
+    }
 }
 
 /// Verify the chip's Active Authentication signature over the challenge. Staged.

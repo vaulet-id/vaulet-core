@@ -34,6 +34,10 @@ x509-cert = "0.2"
 cms = "0.2"
 rsa = { version = "0.9", features = ["sha2", "sha1"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
+# Generic ECDSA verification over explicit Weierstrass domain parameters — Thai
+# (and other) ePassport DSCs embed brainpoolP256r1 as explicit params, which the
+# NIST-specific p256/p384 crates can't parse and RustCrypto has no stable curve for.
+num-bigint = "0.4"
 ecdsa = "0.16"
 # SD-JWT VC + KB-JWT mechanics (ADR 0004). SoftwareKey is the external ES256
 # JwsSigner, so this crate never owns key material.
