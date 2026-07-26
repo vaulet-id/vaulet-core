@@ -38,16 +38,26 @@ pub struct PassportVerdict {
     pub chain: ChainStatus,
     /// Active Authentication result. `Some(false)` means the chip answered the
     /// challenge and the answer did not verify. `None` means the check did not
-    /// happen at all — no AA material was supplied, or the key type is one we
-    /// cannot verify (see `aa_unverifiable`).
+    /// happen at all — no AA material was supplied, the material was ignored
+    /// because the SOD does not cover the DG15 that carries the answering key
+    /// (the reason is in `notes`), or the key type is one we cannot verify (see
+    /// `aa_unverifiable`).
     pub active_auth: Option<bool>,
     /// AA material *was* supplied but its key type is not implemented (RSA
     /// ISO/IEC 9796-2 DSS1) or its EC curve is one this verifier cannot parse
     /// (named-OID brainpool, P-521), so the challenge-response was neither proved nor
     /// disproved. `active_auth` is `None` in that case, exactly as for a chip
     /// with no AA key at all; this flag is what tells the two apart, so a caller
-    /// that demands a proof can say "not verified" instead of "not supplied"
-    /// and never read the absence as success. The reason is also in `notes`.
+    /// can say "not verified" instead of "not supplied" and never read the
+    /// absence as success. The reason is also in `notes`.
+    ///
+    /// It is a *diagnosis*, never a credit: an unverified answer is not a proof,
+    /// so this flag never buys genuineness back ([`Self::active_auth_ok`]). The
+    /// key type is read off DG15 alone — the signature bytes are never looked at
+    /// — so treating it as an excuse would let anyone who once read a genuine
+    /// RSA-AA chip (EF.SOD, DG1, DG2 and EF.DG15 are all public, only the AA
+    /// private key is not) replay that material with a junk signature and be
+    /// called genuine.
     pub aa_unverifiable: bool,
     /// The SOD digest algorithm (e.g. "SHA-256").
     pub hash_algo: String,
@@ -62,13 +72,40 @@ pub struct PassportVerdict {
 }
 
 impl PassportVerdict {
-    /// Genuine document: integrity + signature + a trusted chain. (AA, when
-    /// present, must also hold.)
+    /// Genuine document: integrity + signature + a trusted chain, and an Active
+    /// Authentication result that does not stand in the way ([`Self::active_auth_ok`]).
     pub fn is_genuine(&self) -> bool {
         self.dg_integrity
             && self.sod_signature
             && self.chain == ChainStatus::Trusted
-            && self.active_auth != Some(false)
+            && self.active_auth_ok()
+    }
+
+    /// Whether Active Authentication lets this document be called genuine.
+    ///
+    /// A chip that answered wrongly never passes. A document whose SOD lists a
+    /// DG15 ([`Self::supports_active_auth`]) owes an anti-clone proof, so
+    /// anything short of a *verified* answer does not pass either. There is no
+    /// exemption for a proof this verifier could not check (`aa_unverifiable`:
+    /// RSA ISO/IEC 9796-2 DSS1, an unparseable curve): "we cannot check this key
+    /// type" must not be worth more than "no proof at all", or a clone would buy
+    /// genuineness back for free by sending junk instead of nothing — the flag is
+    /// set from the DG15 key type alone, without ever looking at the signature,
+    /// and DG15 is public data anyone who read the chip once can replay.
+    ///
+    /// Which of the two happened still matters to a relying party, and the
+    /// verdict keeps saying it — `active_auth`, `aa_unverifiable` and `sod_dgs`
+    /// separate "answered wrongly" from "answered with a key type we do not
+    /// implement" from "did not answer" — but none of them is a proof, so none of
+    /// them reaches this far.
+    ///
+    /// A document whose SOD lists no DG15 has nothing to prove, so it is genuine
+    /// without an AA result, exactly as before.
+    fn active_auth_ok(&self) -> bool {
+        if self.supports_active_auth() {
+            return self.active_auth == Some(true);
+        }
+        self.active_auth != Some(false)
     }
 
     /// Which of `required` the SOD did **not** cover, in the order given.
@@ -144,23 +181,52 @@ pub fn verify_passport(
 
     // 4) Active Authentication. Only a chip that answered *and* answered wrongly
     //    is `Some(false)`: a key type or curve we cannot verify is not evidence of
-    //    a clone, it is a gap in this verifier, and reporting it as a failed check
-    //    would stamp genuine RSA-AA and brainpool-AA passports as inauthentic.
+    //    a clone, it is a gap in this verifier, and accusing every genuine RSA-AA
+    //    and brainpool-AA chip of failing its anti-clone check would be a lie
+    //    about what happened. It is not a proof either — `aa_unverifiable` is a
+    //    diagnosis a caller reads, and `is_genuine` does not forgive it.
+    //
+    //    The answer is only worth checking when the SOD covers the DG15 that
+    //    carries the answering key. Otherwise that key is simply whatever the
+    //    caller handed us, and a signature from it proves possession of a key no
+    //    issuing state ever vouched for. Such material is *unusable*, not
+    //    incriminating: it is ignored — noted, and reported exactly as if none had
+    //    been supplied — so that a caller can never read `active_auth = true` off
+    //    a key the SOD does not cover, while a genuine but non-conformant document
+    //    whose SOD omits DG15 (an EF.COM/SOD data-group-list mismatch) is still
+    //    judged on its Passive Authentication, not disqualified by it.
     let mut active_auth = None;
     let mut aa_unverifiable = false;
     if let Some((dg15, challenge, sig)) = aa {
-        match verify_active_auth(dg15, challenge, sig) {
-            Ok(AaCheck::Verified) => active_auth = Some(true),
-            Ok(AaCheck::Failed) => active_auth = Some(false),
-            Ok(AaCheck::Unsupported(why)) => {
-                aa_unverifiable = true;
-                notes.push(format!("AA not verified: {why}"));
-            }
-            // Malformed material (DG15 that is not an SPKI, unreadable signature):
-            // the chip's own answer is unusable, which is a failed check.
-            Err(e) => {
-                active_auth = Some(false);
-                notes.push(format!("AA: {e}"));
+        // Hashed against the SOD directly rather than via `checked`, so the key
+        // that answers is the covered one even when the caller left DG15 out of
+        // `dgs` (where a substitution could not touch `dg_integrity`).
+        let covered = lds
+            .hashes
+            .get(&15)
+            .is_some_and(|expected| digest(&lds.hash_algo, dg15) == *expected);
+        if !covered {
+            notes.push(if lds.hashes.contains_key(&15) {
+                "AA ignored: the supplied DG15 is not the one the SOD covers".into()
+            } else {
+                "AA ignored: the SOD does not cover DG15".to_string()
+            });
+        } else {
+            match verify_active_auth(dg15, challenge, sig) {
+                Ok(AaCheck::Verified) => active_auth = Some(true),
+                Ok(AaCheck::Failed) => active_auth = Some(false),
+                Ok(AaCheck::Unsupported(why)) => {
+                    aa_unverifiable = true;
+                    notes.push(format!("AA not verified: {why}"));
+                }
+                // Malformed material (DG15 that is not an SPKI, unreadable
+                // signature): the chip's own answer is unusable, which is a failed
+                // check. The bytes are chip-authentic — the SOD covers them — so
+                // this is the document's own defect, not a substituted key.
+                Err(e) => {
+                    active_auth = Some(false);
+                    notes.push(format!("AA: {e}"));
+                }
             }
         }
     }
