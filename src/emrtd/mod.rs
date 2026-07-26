@@ -137,7 +137,9 @@ pub fn verify_passport(
     }
     checked.sort_unstable();
 
-    // 2) SOD signature + 3) chain (staged — see verify_sod_signature).
+    // 2) SOD signature (verified against the DSC embedded in the SOD) +
+    //    3) the DSC → CSCA chain. Both are real checks; the chain can only reach
+    //    `Trusted` when the caller supplied an anchor for the issuing country.
     let (sod_signature, chain) = verify_sod_signature(ci, csca, &mut notes);
 
     // 4) Active Authentication. Only a chip that answered *and* answered wrongly
@@ -340,7 +342,7 @@ fn signed_data_econtent(ci: &[u8]) -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// SOD signature + chain, Active Authentication (staged — see notes)
+// SOD signature + chain, Active Authentication
 // ---------------------------------------------------------------------------
 
 const OID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
