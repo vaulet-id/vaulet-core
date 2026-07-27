@@ -14,7 +14,16 @@ test-fixtures = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip` is REQUIRED, not a nicety. Without it serde_json's default
+# number scanner is a fast approximation that can land one ULP away from the
+# value the JSON text denotes. The capture envelope carries ~1000 f64 landmark
+# values whose decimal form comes from Dart's `double.toString()` — the shortest
+# round-tripping representation, which needs 17 significant digits for roughly
+# a tenth of real values. Misparsing any one of them changes the float64 bytes
+# this server canonicalizes, so its recomputed bundle_hash cannot match the one
+# the device signed, and an honest capture is refused as "did-jws binding
+# invalid". The feature makes the parser correctly rounded.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
 p256 = { version = "0.13", features = ["ecdsa", "jwk"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
