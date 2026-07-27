@@ -395,7 +395,7 @@ mod tests {
     /// The belt_v1 envelope fixture, shaped exactly like `BeltBundle.hashedContent()`.
     fn belt_envelope_fixture() -> serde_json::Value {
         json!({
-            "belt_version": "1.0",
+            "belt_version": "2.0",
             "session_id": "sess-1",
             "nonce": "nonce-1",
             "platform": "ios",
@@ -476,7 +476,7 @@ mod tests {
     const SHARED_VECTOR_LEN: usize = 740;
     /// sha256 (lowercase hex) of that encoding.
     const SHARED_VECTOR_SHA256: &str =
-        "f71cb92f2b5321b3a0190f70fcc140072f04bec225c76ef7a8513a8b1b0fbac6";
+        "05c0031fce26c6887c4ec84beb757792d03e2bc04643671ccc349dfc5e66cc63";
 
     /// The same envelope WITH the source-document section (spec §5.1 B): the
     /// passport evidence named by content hash. This is the shape the DTC flow
@@ -513,7 +513,7 @@ mod tests {
     const DOCUMENTED_VECTOR_LEN: usize = 799;
     /// sha256 (lowercase hex) of that encoding.
     const DOCUMENTED_VECTOR_SHA256: &str =
-        "f54101592b905e04233b9c31faf367ffba981aec687f9c6aeee281bbbf751e79";
+        "177158f4602d356e8268b6026f7827c01b117ae239d1d2b45c21f2e0e13b989d";
 
     /// The same envelope with its two clock fields pushed to the ends of the
     /// i64 range — the values a caller can put in `captured_at` / `clock_base`
@@ -543,5 +543,5 @@ mod tests {
     const BOUNDARY_VECTOR_LEN: usize = 748;
     /// sha256 (lowercase hex) of that encoding.
     const BOUNDARY_VECTOR_SHA256: &str =
-        "5c6f8b1b3eb17fbf0357deaa46ae8f3dc880b393074b5b536990ce459baf7098";
+        "2d8523a53ea8a53a68d8017c9011a54788f9d5d828fe7a51b1d62a6319ec7dfa";
 }
