@@ -40,10 +40,21 @@ use p256::PublicKey;
 use super::{ChatError, Result};
 
 /// Short on purpose: every character of it is modules in the QR code, and it
-/// buys nothing but a scheme a phone can route. Still a URL, so any camera app
-/// can read the code while the wallet has no scanner of its own.
+/// buys nothing but a scheme a phone can route.
 const SCHEME: &str = "vlt:i:";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+
+/// Compressed P-256 points are always this long, so carrying a length for them
+/// spends four bytes saying what the version already says.
+const POINT_LEN: usize = 33;
+
+/// `flags` bit 0: the mediator is the default one, and its URL is omitted.
+/// A card for any other mediator still spells it out — the flag compresses the
+/// common case without making the uncommon one unrepresentable.
+const FLAG_DEFAULT_MEDIATOR: u8 = 1 << 0;
+/// `flags` bit 1: a key package follows. Absent in a QR code, present in the
+/// sealed introduction.
+const FLAG_HAS_KEY_PACKAGE: u8 = 1 << 1;
 
 /// Everything one device needs to start talking to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +96,14 @@ fn put(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn take_point<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let (point, rest) = bytes
+        .split_at_checked(POINT_LEN)
+        .ok_or(ChatError::Malformed("invitation"))?;
+    *bytes = rest;
+    Ok(point)
+}
+
 fn take<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
     let (len, rest) = bytes
         .split_at_checked(4)
@@ -98,12 +117,28 @@ fn take<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 /// Encode for display as a QR code or a link.
-pub fn encode(invitation: &Invitation) -> Result<String> {
-    let mut body = vec![VERSION];
-    put(&mut body, invitation.mediator.as_bytes());
-    put(&mut body, &compress(&invitation.inbox_public_key)?);
-    put(&mut body, &compress(&invitation.envelope_public_key)?);
-    put(&mut body, &invitation.key_package);
+///
+/// `default_mediator` is the URL this build ships with. When the card names
+/// that one, it is replaced by a single bit — which is most of what separates a
+/// code you have to hold still for from one that reads at a glance.
+pub fn encode(invitation: &Invitation, default_mediator: &str) -> Result<String> {
+    let mut flags = 0u8;
+    if invitation.mediator == default_mediator {
+        flags |= FLAG_DEFAULT_MEDIATOR;
+    }
+    if invitation.has_key_package {
+        flags |= FLAG_HAS_KEY_PACKAGE;
+    }
+
+    let mut body = vec![VERSION, flags];
+    if flags & FLAG_DEFAULT_MEDIATOR == 0 {
+        put(&mut body, invitation.mediator.as_bytes());
+    }
+    body.extend_from_slice(&compress(&invitation.inbox_public_key)?);
+    body.extend_from_slice(&compress(&invitation.envelope_public_key)?);
+    if invitation.has_key_package {
+        put(&mut body, &invitation.key_package);
+    }
 
     Ok(format!("{SCHEME}{}", B64.encode(body)))
 }
@@ -113,7 +148,7 @@ pub fn encode(invitation: &Invitation) -> Result<String> {
 /// This is the one place in the chat code that meets input chosen by a
 /// stranger, so every length is checked and nothing is trusted to be
 /// well-formed.
-pub fn decode(text: &str) -> Result<Invitation> {
+pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
     let encoded = text
         .trim()
         .strip_prefix(SCHEME)
@@ -122,18 +157,32 @@ pub fn decode(text: &str) -> Result<Invitation> {
         .decode(encoded)
         .map_err(|_| ChatError::Malformed("invitation encoding"))?;
 
-    let (&version, mut rest) = body
+    let (&version, rest) = body
         .split_first()
         .ok_or(ChatError::Malformed("empty invitation"))?;
     if version != VERSION {
         return Err(ChatError::UnsupportedInvitationVersion(version));
     }
+    let (&flags, mut rest) = rest
+        .split_first()
+        .ok_or(ChatError::Malformed("invitation flags"))?;
 
-    let mediator = String::from_utf8(take(&mut rest)?.to_vec())
-        .map_err(|_| ChatError::Malformed("invitation mediator"))?;
-    let inbox_public_key = decompress(take(&mut rest)?)?;
-    let envelope_public_key = decompress(take(&mut rest)?)?;
-    let key_package = take(&mut rest)?.to_vec();
+    let mediator = if flags & FLAG_DEFAULT_MEDIATOR != 0 {
+        default_mediator.to_string()
+    } else {
+        String::from_utf8(take(&mut rest)?.to_vec())
+            .map_err(|_| ChatError::Malformed("invitation mediator"))?
+    };
+
+    let inbox_public_key = decompress(take_point(&mut rest)?)?;
+    let envelope_public_key = decompress(take_point(&mut rest)?)?;
+
+    let has_key_package = flags & FLAG_HAS_KEY_PACKAGE != 0;
+    let key_package = if has_key_package {
+        take(&mut rest)?.to_vec()
+    } else {
+        Vec::new()
+    };
 
     if !rest.is_empty() {
         return Err(ChatError::Malformed("trailing invitation data"));
@@ -148,7 +197,7 @@ pub fn decode(text: &str) -> Result<Invitation> {
         mediator,
         inbox_public_key,
         envelope_public_key,
-        has_key_package: !key_package.is_empty(),
+        has_key_package,
         key_package,
     })
 }
@@ -163,6 +212,7 @@ mod tests {
         "0427a88cbee10bfd805945e934a80abcea2bc0869f6e01221230a3aa21a67aa9f7",
         "a42146f18f72efacac29104f554b239761f5607891765bd2b876bbc0e1322785",
     );
+    const DEFAULT_MEDIATOR: &str = "https://vaulet-mediator.fly.dev";
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -171,106 +221,156 @@ mod tests {
             .collect()
     }
 
-    fn sample() -> Invitation {
+    fn card() -> Invitation {
         Invitation {
-            mediator: "https://mediator.example".into(),
+            mediator: DEFAULT_MEDIATOR.to_string(),
             inbox_public_key: hex(POINT_A),
             envelope_public_key: hex(POINT_A),
-            key_package: vec![0xde, 0xad, 0xbe, 0xef],
-            has_key_package: true,
+            key_package: Vec::new(),
+            has_key_package: false,
         }
     }
 
+    fn introduction() -> Invitation {
+        Invitation {
+            key_package: vec![0xde, 0xad, 0xbe, 0xef],
+            has_key_package: true,
+            ..card()
+        }
+    }
+
+    fn round_trip(invitation: &Invitation) -> Invitation {
+        decode(
+            &encode(invitation, DEFAULT_MEDIATOR).unwrap(),
+            DEFAULT_MEDIATOR,
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn an_invitation_survives_the_round_trip() {
-        assert_eq!(decode(&encode(&sample()).unwrap()).unwrap(), sample());
+    fn a_card_survives_the_round_trip() {
+        assert_eq!(round_trip(&card()), card());
+    }
+
+    #[test]
+    fn an_introduction_survives_with_its_key_package() {
+        assert_eq!(round_trip(&introduction()), introduction());
+    }
+
+    /// The default mediator is a bit rather than a URL, which is most of what
+    /// separates a code you hold still for from one that reads at a glance.
+    #[test]
+    fn the_default_mediator_costs_almost_nothing_and_others_still_work() {
+        let mut elsewhere = card();
+        elsewhere.mediator = "https://someone-elses-mediator.example".into();
+
+        assert_eq!(round_trip(&elsewhere), elsewhere);
+        assert!(
+            encode(&card(), DEFAULT_MEDIATOR).unwrap().len()
+                < encode(&elsewhere, DEFAULT_MEDIATOR).unwrap().len()
+        );
+    }
+
+    /// A card read by a build pointing somewhere else must not silently inherit
+    /// that build's mediator for a sender who never chose it.
+    #[test]
+    fn a_default_flagged_card_resolves_to_the_readers_default() {
+        let text = encode(&card(), DEFAULT_MEDIATOR).unwrap();
+        let elsewhere = decode(&text, "https://another.example").unwrap();
+        assert_eq!(elsewhere.mediator, "https://another.example");
+    }
+
+    #[test]
+    fn a_card_is_much_shorter_than_an_introduction() {
+        assert!(
+            encode(&card(), DEFAULT_MEDIATOR).unwrap().len()
+                < encode(&introduction(), DEFAULT_MEDIATOR).unwrap().len()
+        );
     }
 
     #[test]
     fn surrounding_whitespace_is_forgiven() {
         // Pasted text picks up newlines; refusing it would be a papercut with
         // no security value, since the payload is checked either way.
-        let text = format!("  {}\n", encode(&sample()).unwrap());
-        assert_eq!(decode(&text).unwrap(), sample());
-    }
-
-    /// The QR form: a contact card and nothing else. Scanning adds a contact,
-    /// so there is no reason for the code to carry the machinery for a room.
-    #[test]
-    fn a_contact_card_carries_no_key_package_and_is_far_shorter() {
-        let mut card = sample();
-        card.key_package = Vec::new();
-        card.has_key_package = false;
-
-        let decoded = decode(&encode(&card).unwrap()).unwrap();
-        assert!(!decoded.has_key_package);
-        assert!(decoded.key_package.is_empty());
-        assert!(encode(&card).unwrap().len() < encode(&sample()).unwrap().len());
+        let text = format!("  {}\n", encode(&card(), DEFAULT_MEDIATOR).unwrap());
+        assert_eq!(decode(&text, DEFAULT_MEDIATOR).unwrap(), card());
     }
 
     #[test]
     fn a_credential_offer_is_not_mistaken_for_an_invitation() {
         assert!(matches!(
-            decode("openid-credential-offer://?credential_offer=%7B%7D"),
+            decode(
+                "openid-credential-offer://?credential_offer=%7B%7D",
+                DEFAULT_MEDIATOR
+            ),
             Err(ChatError::Malformed(_))
         ));
     }
 
     #[test]
     fn a_truncated_invitation_is_refused_rather_than_half_read() {
-        let full = encode(&sample()).unwrap();
-        let cut = &full[..full.len() - 8];
-        assert!(decode(cut).is_err());
+        let full = encode(&card(), DEFAULT_MEDIATOR).unwrap();
+        assert!(decode(&full[..full.len() - 8], DEFAULT_MEDIATOR).is_err());
     }
 
     #[test]
     fn trailing_junk_is_refused() {
-        let mut body = vec![VERSION];
-        put(&mut body, b"https://mediator.example");
-        put(&mut body, &compress(&hex(POINT_A)).unwrap());
-        put(&mut body, &compress(&hex(POINT_A)).unwrap());
-        put(&mut body, &[0xde]);
+        let mut body = vec![VERSION, FLAG_DEFAULT_MEDIATOR];
+        body.extend_from_slice(&compress(&hex(POINT_A)).unwrap());
+        body.extend_from_slice(&compress(&hex(POINT_A)).unwrap());
         body.extend_from_slice(b"extra");
 
         let text = format!("{SCHEME}{}", B64.encode(body));
-        assert!(matches!(decode(&text), Err(ChatError::Malformed(_))));
+        assert!(matches!(
+            decode(&text, DEFAULT_MEDIATOR),
+            Err(ChatError::Malformed(_))
+        ));
     }
 
     /// A length field claiming more than the buffer holds must not panic.
     #[test]
     fn a_lying_length_is_refused_rather_than_panicking() {
-        let mut body = vec![VERSION];
+        let mut body = vec![VERSION, FLAG_HAS_KEY_PACKAGE];
+        body.extend_from_slice(&compress(&hex(POINT_A)).unwrap());
+        body.extend_from_slice(&compress(&hex(POINT_A)).unwrap());
         body.extend_from_slice(&u32::MAX.to_be_bytes());
         body.extend_from_slice(b"short");
 
         let text = format!("{SCHEME}{}", B64.encode(body));
-        assert!(matches!(decode(&text), Err(ChatError::Malformed(_))));
+        assert!(matches!(
+            decode(&text, DEFAULT_MEDIATOR),
+            Err(ChatError::Malformed(_))
+        ));
     }
 
     #[test]
     fn a_mediator_that_is_not_a_url_is_refused() {
         // Otherwise the first message of a conversation goes somewhere the
         // sender did not choose.
-        let mut invitation = sample();
+        let mut invitation = card();
         invitation.mediator = "mediator.example".into();
+        let text = encode(&invitation, DEFAULT_MEDIATOR).unwrap();
         assert!(matches!(
-            decode(&encode(&invitation).unwrap()),
+            decode(&text, DEFAULT_MEDIATOR),
             Err(ChatError::Malformed(_))
         ));
     }
 
     #[test]
     fn a_future_invitation_version_is_refused_by_name() {
-        let mut body = encode(&sample())
-            .unwrap()
-            .strip_prefix(SCHEME)
-            .map(|b| B64.decode(b).unwrap())
+        let mut body = B64
+            .decode(
+                encode(&card(), DEFAULT_MEDIATOR)
+                    .unwrap()
+                    .strip_prefix(SCHEME)
+                    .unwrap(),
+            )
             .unwrap();
         body[0] = 7;
 
         let text = format!("{SCHEME}{}", B64.encode(body));
         assert!(matches!(
-            decode(&text),
+            decode(&text, DEFAULT_MEDIATOR),
             Err(ChatError::UnsupportedInvitationVersion(7))
         ));
     }
