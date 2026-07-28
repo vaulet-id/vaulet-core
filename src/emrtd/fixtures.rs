@@ -62,10 +62,25 @@ impl SyntheticPassport {
     }
 }
 
+/// The MRZ inside the fixture's EF.DG1: ANNA MARIA ERIKSSON, Utopian, born
+/// 1974-08-12, passport L898902C3 expiring 2035-04-15.
+///
+/// ICAO 9303's own worked example, with the expiry moved into the future and
+/// its check digits recomputed — the issuer refuses an expired document, and a
+/// fixture that expired in 2012 would only ever exercise that refusal.
+pub const SYNTHETIC_MRZ: &str = concat!(
+    "P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<",
+    "L898902C36UTO7408122F3504152ZE184226B<<<<<16",
+);
+
 /// Build a synthetic passport with the default DG1/DG2 payloads.
 pub fn synthetic_passport() -> SyntheticPassport {
     let mut dgs = BTreeMap::new();
-    dgs.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
+    // A real TD3 zone, every check digit correct. It used to be a placeholder
+    // string, which was fine while nothing read DG1 — but the issuer now reads
+    // it, and a fixture that cannot be read is a fixture that only exercises
+    // the failure path (ICAO 9303 part 3's own worked example, "Utopia").
+    dgs.insert(1u8, crate::emrtd::dg1::wrap_dg1(SYNTHETIC_MRZ));
     dgs.insert(2u8, b"SYNTHETIC-DG2-NOT-A-REAL-FACE".to_vec());
     synthetic_passport_with_dgs(dgs)
 }

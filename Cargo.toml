@@ -61,6 +61,7 @@ async-trait = "0.1"
 # Minimal executor to drive the (immediately-resolving) async signer from our
 # sync FFI-facing functions. No real await points, so no runtime is needed.
 pollster = "0.3"
+mrz = "0.5.1"
 
 [dev-dependencies]
 tempfile = "3"

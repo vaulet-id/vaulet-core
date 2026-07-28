@@ -1113,6 +1113,10 @@ fn hash_name(oid: &ObjectIdentifier) -> String {
     .to_string()
 }
 
+/// Reading EF.DG1 — always compiled: the issuer reads the MRZ on every
+/// issuance, it is not a test facility.
+pub mod dg1;
+
 /// Synthetic SOD/DSC/CSCA builders for tests (see `fixtures`). Enabled for this
 /// crate's own tests and, via the `test-fixtures` feature, for the backend's.
 #[cfg(any(test, feature = "test-fixtures"))]
