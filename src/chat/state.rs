@@ -30,6 +30,10 @@ use super::{ChatError, Result};
 /// colliding with keys already in the field.
 const STATE_KEY_INFO: &[u8] = b"vaulet/chat/state/v1";
 
+/// Message history is sealed under its own key, so a mistake that exposes one
+/// store does not hand over the other.
+const HISTORY_KEY_INFO: &[u8] = b"vaulet/chat/history/v1";
+
 /// XChaCha20 nonce, matching [`crate::recovery`] so the wallet has one AEAD.
 const NONCE_LEN: usize = 24;
 pub const KEY_LEN: usize = 32;
@@ -113,9 +117,20 @@ fn decode(mut bytes: &[u8]) -> Result<Snapshot> {
 /// derived per call and never stored — losing the seed loses the conversations,
 /// which is the same trade the rest of the wallet already makes.
 pub fn derive_key_from_seed(seed: &[u8]) -> [u8; KEY_LEN] {
+    derive(seed, STATE_KEY_INFO)
+}
+
+/// The key for stored messages. Plaintext chat history on disk would be the
+/// same mistake the credential store is already flagged for, so it is sealed
+/// with the rest — under a separate label from the MLS state.
+pub fn derive_history_key_from_seed(seed: &[u8]) -> [u8; KEY_LEN] {
+    derive(seed, HISTORY_KEY_INFO)
+}
+
+fn derive(seed: &[u8], info: &[u8]) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
     Hkdf::<Sha256>::new(None, seed)
-        .expand(STATE_KEY_INFO, &mut key)
+        .expand(info, &mut key)
         // Only fails for absurd output lengths; 32 bytes from SHA-256 cannot.
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     key
@@ -152,4 +167,81 @@ pub fn open(key: &[u8; KEY_LEN], sealed: &[u8]) -> Result<Snapshot> {
         .map_err(|_| ChatError::WrongStateKey)?;
 
     decode(&plaintext)
+}
+
+/// Seal arbitrary bytes under a derived key. Used for message history, which
+/// is not MLS state and has no snapshot structure — just bytes the platform
+/// stores.
+pub fn seal_bytes(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand_core::OsRng.fill_bytes(&mut nonce);
+
+    let ciphertext = XChaCha20Poly1305::new(key.into())
+        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .map_err(|e| ChatError::Mls(format!("seal: {e}")))?;
+
+    let mut out = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
+    out.push(VERSION);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+pub fn open_bytes(key: &[u8; KEY_LEN], sealed: &[u8]) -> Result<Vec<u8>> {
+    let (&version, rest) = sealed
+        .split_first()
+        .ok_or(ChatError::Malformed("sealed bytes"))?;
+    if version != VERSION {
+        return Err(ChatError::UnsupportedStateVersion(version));
+    }
+    let (nonce, ciphertext) = rest
+        .split_at_checked(NONCE_LEN)
+        .ok_or(ChatError::Malformed("sealed bytes"))?;
+
+    XChaCha20Poly1305::new(key.into())
+        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .map_err(|_| ChatError::WrongStateKey)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEED: &[u8] = b"a seed for the history key tests";
+
+    #[test]
+    fn history_round_trips() {
+        let key = derive_history_key_from_seed(SEED);
+        let sealed = seal_bytes(&key, b"[{\"text\":\"hello\"}]").unwrap();
+        assert_eq!(
+            open_bytes(&key, &sealed).unwrap(),
+            b"[{\"text\":\"hello\"}]"
+        );
+    }
+
+    #[test]
+    fn history_is_not_readable_at_rest() {
+        let key = derive_history_key_from_seed(SEED);
+        let sealed = seal_bytes(&key, b"meet at six").unwrap();
+        assert!(!sealed.windows(11).any(|w| w == b"meet at six"));
+    }
+
+    /// Reusing the MLS state key for history would mean one mistake exposed
+    /// both stores.
+    #[test]
+    fn history_and_state_use_different_keys() {
+        assert_ne!(
+            derive_history_key_from_seed(SEED),
+            derive_key_from_seed(SEED)
+        );
+    }
+
+    #[test]
+    fn the_state_key_cannot_open_history() {
+        let sealed = seal_bytes(&derive_history_key_from_seed(SEED), b"private").unwrap();
+        assert!(matches!(
+            open_bytes(&derive_key_from_seed(SEED), &sealed),
+            Err(ChatError::WrongStateKey)
+        ));
+    }
 }

@@ -25,7 +25,10 @@ pub mod inbox;
 pub mod invitation;
 mod state;
 
-pub use state::{derive_key_from_seed, KEY_LEN as STATE_KEY_LEN};
+pub use state::{
+    derive_history_key_from_seed, derive_key_from_seed, open_bytes, seal_bytes,
+    KEY_LEN as STATE_KEY_LEN,
+};
 
 use openmls::prelude::{tls_codec::*, *};
 use openmls_basic_credential::SignatureKeyPair;
