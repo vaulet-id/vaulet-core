@@ -4,6 +4,7 @@
 //! crate. Flutter is UI only, calling in over FFI (flutter_rust_bridge).
 //! The same crate is reused by the backend (axum) and, later, WASM.
 
+pub mod chat;
 pub mod credential;
 pub mod dcbor;
 pub mod did;
