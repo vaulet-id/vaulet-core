@@ -5,20 +5,28 @@
 //! forbids. So everything needed to reach a person travels in the one exchange
 //! that has to happen anyway: a QR code or a link.
 //!
-//! It carries, all of it public:
+//! **Scanning adds a contact; it does not open a room.** The code carries only
+//! what is needed to send that person one sealed message:
 //!
 //! - **where** — the mediator, and the inbox at it;
-//! - **how to seal to them** — the HPKE receiving key for this contact;
-//! - **how to add them to a group while they sleep** — an MLS key package;
-//! **Not** who they are. That is in the MLS credential inside the key package
-//! and must be read from there: carrying it as a field of its own would let an
-//! invitation claim one identity while presenting a key package for another,
-//! which is the impersonation D9 exists to stop.
+//! - **how to seal to them** — the HPKE receiving key for this contact.
 //!
-//! Nothing here is secret, and none of it needs to be: it is the set of public
-//! facts required to send someone a first sealed message. It *is* linkable —
-//! anyone who photographs the code learns that inbox belongs to whoever showed
-//! it — which is why an invitation is per-contact and not a public handle.
+//! The MLS key package is *optional here on purpose*. In a QR it is left out,
+//! which takes the code from about 990 characters to 260 — the difference
+//! between a dense grid a camera has to work at and one that reads instantly.
+//! It is filled in for the sealed introduction the two sides exchange
+//! afterwards, where size costs nothing.
+//!
+//! That split also earns something better than size: a key package contains the
+//! holder's DID and signature key, so while it rode in the QR **anyone who
+//! photographed the screen learned who you were.** Now a photograph yields an
+//! inbox address and an encryption key, and identity reaches only the person
+//! who actually answers.
+//!
+//! **Who they are** is never a field of its own. It lives in the MLS credential
+//! inside the key package and must be read from there, or an introduction could
+//! claim one identity while presenting a key package for another — the
+//! impersonation D9 exists to stop.
 //!
 //! **Both sides need one.** A scanner learns where to send but the person
 //! scanned learns nothing, so the reply address travels back in an
@@ -43,8 +51,12 @@ pub struct Invitation {
     pub inbox_public_key: Vec<u8>,
     /// HPKE key to seal envelopes to. Distinct from the inbox key on purpose.
     pub envelope_public_key: Vec<u8>,
-    /// MLS key package, so they can be added to a group while asleep.
+    /// MLS key package, so they can be added to a group while asleep. Empty in
+    /// a QR code, present in the sealed introduction — see the module docs.
     pub key_package: Vec<u8>,
+
+    /// True when this carries enough to open a room, not merely to write once.
+    pub has_key_package: bool,
 }
 
 fn put(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -115,6 +127,7 @@ pub fn decode(text: &str) -> Result<Invitation> {
         mediator,
         inbox_public_key,
         envelope_public_key,
+        has_key_package: !key_package.is_empty(),
         key_package,
     })
 }
@@ -129,6 +142,7 @@ mod tests {
             inbox_public_key: vec![4, 1, 2, 3],
             envelope_public_key: vec![4, 9, 8, 7],
             key_package: vec![0xde, 0xad, 0xbe, 0xef],
+            has_key_package: true,
         }
     }
 
@@ -143,6 +157,20 @@ mod tests {
         // no security value, since the payload is checked either way.
         let text = format!("  {}\n", encode(&sample()));
         assert_eq!(decode(&text).unwrap(), sample());
+    }
+
+    /// The QR form: a contact card and nothing else. Scanning adds a contact,
+    /// so there is no reason for the code to carry the machinery for a room.
+    #[test]
+    fn a_contact_card_carries_no_key_package_and_is_far_shorter() {
+        let mut card = sample();
+        card.key_package = Vec::new();
+        card.has_key_package = false;
+
+        let decoded = decode(&encode(&card)).unwrap();
+        assert!(!decoded.has_key_package);
+        assert!(decoded.key_package.is_empty());
+        assert!(encode(&card).len() < encode(&sample()).len());
     }
 
     #[test]
