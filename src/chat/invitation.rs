@@ -34,11 +34,15 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine as _;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::PublicKey;
 
 use super::{ChatError, Result};
 
-/// `vaulet://invite?d=…` so the same string works as a QR code and as a link.
-const SCHEME: &str = "vaulet://invite?d=";
+/// Short on purpose: every character of it is modules in the QR code, and it
+/// buys nothing but a scheme a phone can route. Still a URL, so any camera app
+/// can read the code while the wallet has no scanner of its own.
+const SCHEME: &str = "vlt:i:";
 const VERSION: u8 = 1;
 
 /// Everything one device needs to start talking to another.
@@ -59,6 +63,23 @@ pub struct Invitation {
     pub has_key_package: bool,
 }
 
+/// P-256 points ride compressed: 33 bytes instead of 65, for the same key.
+/// Two of them are half the card, so this is most of what keeps the code
+/// sparse enough to read at a glance.
+fn compress(public_key: &[u8]) -> Result<Vec<u8>> {
+    let key =
+        PublicKey::from_sec1_bytes(public_key).map_err(|_| ChatError::Malformed("public key"))?;
+    Ok(key.to_encoded_point(true).as_bytes().to_vec())
+}
+
+/// Back to the uncompressed form everything else expects, so the saving lives
+/// entirely inside this module.
+fn decompress(public_key: &[u8]) -> Result<Vec<u8>> {
+    let key =
+        PublicKey::from_sec1_bytes(public_key).map_err(|_| ChatError::Malformed("public key"))?;
+    Ok(key.to_encoded_point(false).as_bytes().to_vec())
+}
+
 fn put(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     out.extend_from_slice(bytes);
@@ -77,14 +98,14 @@ fn take<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 /// Encode for display as a QR code or a link.
-pub fn encode(invitation: &Invitation) -> String {
+pub fn encode(invitation: &Invitation) -> Result<String> {
     let mut body = vec![VERSION];
     put(&mut body, invitation.mediator.as_bytes());
-    put(&mut body, &invitation.inbox_public_key);
-    put(&mut body, &invitation.envelope_public_key);
+    put(&mut body, &compress(&invitation.inbox_public_key)?);
+    put(&mut body, &compress(&invitation.envelope_public_key)?);
     put(&mut body, &invitation.key_package);
 
-    format!("{SCHEME}{}", B64.encode(body))
+    Ok(format!("{SCHEME}{}", B64.encode(body)))
 }
 
 /// Decode a scanned or pasted invitation.
@@ -110,8 +131,8 @@ pub fn decode(text: &str) -> Result<Invitation> {
 
     let mediator = String::from_utf8(take(&mut rest)?.to_vec())
         .map_err(|_| ChatError::Malformed("invitation mediator"))?;
-    let inbox_public_key = take(&mut rest)?.to_vec();
-    let envelope_public_key = take(&mut rest)?.to_vec();
+    let inbox_public_key = decompress(take(&mut rest)?)?;
+    let envelope_public_key = decompress(take(&mut rest)?)?;
     let key_package = take(&mut rest)?.to_vec();
 
     if !rest.is_empty() {
@@ -136,11 +157,25 @@ pub fn decode(text: &str) -> Result<Invitation> {
 mod tests {
     use super::*;
 
+    /// Real P-256 points, generated with openssl — compression is arithmetic
+    /// on the curve, so placeholder bytes cannot exercise it.
+    const POINT_A: &str = concat!(
+        "0427a88cbee10bfd805945e934a80abcea2bc0869f6e01221230a3aa21a67aa9f7",
+        "a42146f18f72efacac29104f554b239761f5607891765bd2b876bbc0e1322785",
+    );
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     fn sample() -> Invitation {
         Invitation {
             mediator: "https://mediator.example".into(),
-            inbox_public_key: vec![4, 1, 2, 3],
-            envelope_public_key: vec![4, 9, 8, 7],
+            inbox_public_key: hex(POINT_A),
+            envelope_public_key: hex(POINT_A),
             key_package: vec![0xde, 0xad, 0xbe, 0xef],
             has_key_package: true,
         }
@@ -148,14 +183,14 @@ mod tests {
 
     #[test]
     fn an_invitation_survives_the_round_trip() {
-        assert_eq!(decode(&encode(&sample())).unwrap(), sample());
+        assert_eq!(decode(&encode(&sample()).unwrap()).unwrap(), sample());
     }
 
     #[test]
     fn surrounding_whitespace_is_forgiven() {
         // Pasted text picks up newlines; refusing it would be a papercut with
         // no security value, since the payload is checked either way.
-        let text = format!("  {}\n", encode(&sample()));
+        let text = format!("  {}\n", encode(&sample()).unwrap());
         assert_eq!(decode(&text).unwrap(), sample());
     }
 
@@ -167,10 +202,10 @@ mod tests {
         card.key_package = Vec::new();
         card.has_key_package = false;
 
-        let decoded = decode(&encode(&card)).unwrap();
+        let decoded = decode(&encode(&card).unwrap()).unwrap();
         assert!(!decoded.has_key_package);
         assert!(decoded.key_package.is_empty());
-        assert!(encode(&card).len() < encode(&sample()).len());
+        assert!(encode(&card).unwrap().len() < encode(&sample()).unwrap().len());
     }
 
     #[test]
@@ -183,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_truncated_invitation_is_refused_rather_than_half_read() {
-        let full = encode(&sample());
+        let full = encode(&sample()).unwrap();
         let cut = &full[..full.len() - 8];
         assert!(decode(cut).is_err());
     }
@@ -192,8 +227,8 @@ mod tests {
     fn trailing_junk_is_refused() {
         let mut body = vec![VERSION];
         put(&mut body, b"https://mediator.example");
-        put(&mut body, &[4, 1, 2, 3]);
-        put(&mut body, &[4, 9, 8, 7]);
+        put(&mut body, &compress(&hex(POINT_A)).unwrap());
+        put(&mut body, &compress(&hex(POINT_A)).unwrap());
         put(&mut body, &[0xde]);
         body.extend_from_slice(b"extra");
 
@@ -219,7 +254,7 @@ mod tests {
         let mut invitation = sample();
         invitation.mediator = "mediator.example".into();
         assert!(matches!(
-            decode(&encode(&invitation)),
+            decode(&encode(&invitation).unwrap()),
             Err(ChatError::Malformed(_))
         ));
     }
@@ -227,6 +262,7 @@ mod tests {
     #[test]
     fn a_future_invitation_version_is_refused_by_name() {
         let mut body = encode(&sample())
+            .unwrap()
             .strip_prefix(SCHEME)
             .map(|b| B64.decode(b).unwrap())
             .unwrap();
