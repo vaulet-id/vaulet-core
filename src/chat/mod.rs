@@ -22,6 +22,7 @@
 
 pub mod envelope;
 pub mod inbox;
+pub mod invitation;
 mod state;
 
 pub use state::{derive_key_from_seed, KEY_LEN as STATE_KEY_LEN};
@@ -62,6 +63,8 @@ pub enum ChatError {
     /// indistinguishable to the recipient and neither is actionable.
     #[error("this envelope was not addressed to us")]
     NotForUs,
+    #[error("invitation is version {0}, which this build cannot read")]
+    UnsupportedInvitationVersion(u8),
 }
 
 pub type Result<T> = std::result::Result<T, ChatError>;
@@ -361,6 +364,11 @@ impl Session {
             .map_err(mls)?;
         group.merge_pending_commit(&self.provider).map_err(mls)?;
         commit.tls_serialize_detached().map_err(mls)
+    }
+
+    /// What this device presents to other members — its DID today.
+    pub fn identity(&self) -> &[u8] {
+        &self.identity
     }
 
     /// Members' identities, in leaf order.

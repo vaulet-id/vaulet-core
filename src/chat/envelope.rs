@@ -51,6 +51,13 @@ pub enum Kind {
     Welcome = 1,
     /// Anything inside an established group — hand it to `Session::receive`.
     MlsMessage = 2,
+    /// The sender's own invitation, so the recipient can reply.
+    ///
+    /// A scanned QR is one-directional: the scanner learns where to send, the
+    /// person scanned learns nothing. This is how the reply address gets back,
+    /// and it travels sealed rather than in the clear so the mediator does not
+    /// learn which two inboxes belong together.
+    Introduction = 3,
 }
 
 impl Kind {
@@ -58,6 +65,7 @@ impl Kind {
         match byte {
             1 => Ok(Kind::Welcome),
             2 => Ok(Kind::MlsMessage),
+            3 => Ok(Kind::Introduction),
             _ => Err(ChatError::Malformed("unknown envelope kind")),
         }
     }
