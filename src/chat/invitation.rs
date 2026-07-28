@@ -10,7 +10,10 @@
 //! - **where** — the mediator, and the inbox at it;
 //! - **how to seal to them** — the HPKE receiving key for this contact;
 //! - **how to add them to a group while they sleep** — an MLS key package;
-//! - **who they claim to be** — the identity in their MLS credential.
+//! **Not** who they are. That is in the MLS credential inside the key package
+//! and must be read from there: carrying it as a field of its own would let an
+//! invitation claim one identity while presenting a key package for another,
+//! which is the impersonation D9 exists to stop.
 //!
 //! Nothing here is secret, and none of it needs to be: it is the set of public
 //! facts required to send someone a first sealed message. It *is* linkable —
@@ -33,8 +36,6 @@ const VERSION: u8 = 1;
 /// Everything one device needs to start talking to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invitation {
-    /// What their MLS credential says they are — today a DID.
-    pub identity: String,
     /// Base URL of the mediator holding their inbox. Carried rather than
     /// assumed, because a user who moves mediators must stay reachable.
     pub mediator: String,
@@ -66,7 +67,6 @@ fn take<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
 /// Encode for display as a QR code or a link.
 pub fn encode(invitation: &Invitation) -> String {
     let mut body = vec![VERSION];
-    put(&mut body, invitation.identity.as_bytes());
     put(&mut body, invitation.mediator.as_bytes());
     put(&mut body, &invitation.inbox_public_key);
     put(&mut body, &invitation.envelope_public_key);
@@ -96,8 +96,6 @@ pub fn decode(text: &str) -> Result<Invitation> {
         return Err(ChatError::UnsupportedInvitationVersion(version));
     }
 
-    let identity = String::from_utf8(take(&mut rest)?.to_vec())
-        .map_err(|_| ChatError::Malformed("invitation identity"))?;
     let mediator = String::from_utf8(take(&mut rest)?.to_vec())
         .map_err(|_| ChatError::Malformed("invitation mediator"))?;
     let inbox_public_key = take(&mut rest)?.to_vec();
@@ -114,7 +112,6 @@ pub fn decode(text: &str) -> Result<Invitation> {
     }
 
     Ok(Invitation {
-        identity,
         mediator,
         inbox_public_key,
         envelope_public_key,
@@ -128,7 +125,6 @@ mod tests {
 
     fn sample() -> Invitation {
         Invitation {
-            identity: "did:peer:bob".into(),
             mediator: "https://mediator.example".into(),
             inbox_public_key: vec![4, 1, 2, 3],
             envelope_public_key: vec![4, 9, 8, 7],
@@ -167,7 +163,6 @@ mod tests {
     #[test]
     fn trailing_junk_is_refused() {
         let mut body = vec![VERSION];
-        put(&mut body, b"did:peer:bob");
         put(&mut body, b"https://mediator.example");
         put(&mut body, &[4, 1, 2, 3]);
         put(&mut body, &[4, 9, 8, 7]);

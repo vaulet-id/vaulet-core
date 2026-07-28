@@ -369,6 +369,29 @@ impl Session {
         commit.tls_serialize_detached().map_err(mls)
     }
 
+    /// The identity inside a key package, after validating it.
+    ///
+    /// The **only** honest source for "who sent this invitation": an invitation
+    /// carrying a name of its own could present a key package belonging to
+    /// somebody else, and that name is what a user reads before deciding to
+    /// trust the conversation.
+    pub fn identity_in_key_package(key_package: &[u8]) -> Result<Vec<u8>> {
+        let body = MlsMessageIn::tls_deserialize_exact(key_package)
+            .map_err(|_| ChatError::Malformed("key package"))?
+            .extract();
+        let MlsMessageBodyIn::KeyPackage(key_package) = body else {
+            return Err(ChatError::Malformed("not a key package"));
+        };
+        let key_package = key_package
+            .validate(OpenMlsRustCrypto::default().crypto(), ProtocolVersion::Mls10)
+            .map_err(mls)?;
+        Ok(key_package
+            .leaf_node()
+            .credential()
+            .serialized_content()
+            .to_vec())
+    }
+
     /// What this device presents to other members — its DID today.
     pub fn identity(&self) -> &[u8] {
         &self.identity
