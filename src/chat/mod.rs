@@ -20,6 +20,7 @@
 //!   deterministic rule. That rule is not chosen yet, which is why this module
 //!   supports groups of two and leaves larger groups to follow.
 
+pub mod envelope;
 pub mod inbox;
 mod state;
 
@@ -36,6 +37,11 @@ use thiserror::Error;
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
 const SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ECDSA_SECP256R1_SHA256;
 
+/// Application messages are padded to a multiple of this. It costs a little
+/// bandwidth to stop the one thing the mediator can still measure — length —
+/// from describing what was said.
+const PADDING: usize = 64;
+
 #[derive(Debug, Error)]
 pub enum ChatError {
     #[error("mls: {0}")]
@@ -50,6 +56,12 @@ pub enum ChatError {
     UnsupportedStateVersion(u8),
     #[error("wrong key for this sealed state")]
     WrongStateKey,
+    #[error("envelope is version {0}, which this build cannot read")]
+    UnsupportedEnvelopeVersion(u8),
+    /// Sealed to somebody else's key, or altered on the way. The two are
+    /// indistinguishable to the recipient and neither is actionable.
+    #[error("this envelope was not addressed to us")]
+    NotForUs,
 }
 
 pub type Result<T> = std::result::Result<T, ChatError>;
@@ -212,6 +224,10 @@ impl Session {
             &self.signer,
             &MlsGroupCreateConfig::builder()
                 .ciphersuite(CIPHERSUITE)
+                // Quantise ciphertext lengths. The mediator sees sizes even
+                // though it sees nothing else, and unpadded sizes distinguish
+                // "ok" from a paragraph.
+                .padding_size(PADDING)
                 // Without this the joiner needs the ratchet tree out of band;
                 // carrying it in the Welcome is what makes an invitation a
                 // single self-contained blob the mediator can hold.
@@ -269,6 +285,7 @@ impl Session {
             &self.provider,
             &MlsGroupJoinConfig::builder()
                 .use_ratchet_tree_extension(true)
+                .padding_size(PADDING)
                 .build(),
             welcome,
             None,
