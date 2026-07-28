@@ -135,7 +135,7 @@ pub fn encode(handle: &Handle) -> Result<String> {
 pub fn decode(text: &str) -> Result<Handle> {
     let body = B64
         .decode(
-            text.trim()
+            super::invitation::unwrap_link(text)
                 .strip_prefix(PREFIX)
                 .ok_or(ChatError::Malformed("not a vaulet handle"))?,
         )
@@ -225,6 +225,17 @@ mod tests {
         let signature = Signature::from_der(&sign_challenge(SEED, 1, challenge).unwrap()).unwrap();
         let key = VerifyingKey::from_sec1_bytes(&mine(SEED, 0).unwrap().inbox_public_key).unwrap();
         assert!(key.verify(challenge, &signature).is_err());
+    }
+
+    /// Shared as a link, scanned as a bare code — the same handle either way.
+    #[test]
+    fn a_handle_wrapped_in_a_link_decodes_the_same() {
+        let handle = mine(SEED, 0).unwrap();
+        let bare = encode(&handle).unwrap();
+        let link = super::super::invitation::share_link(&bare);
+
+        assert!(link.starts_with("https://"));
+        assert_eq!(decode(&link).unwrap(), handle);
     }
 
     #[test]

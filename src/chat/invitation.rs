@@ -42,6 +42,19 @@ use super::{ChatError, Result};
 /// Short on purpose: every character of it is modules in the QR code, and it
 /// buys nothing but a scheme a phone can route.
 const SCHEME: &str = "vlt:i:";
+
+/// The host universal links are anchored to. **Changing it breaks every link
+/// already shared**, because a universal link names its own host — so this is
+/// the one place it is written, and it is written once.
+///
+/// A subdomain rather than the apex, and deliberately: `vaulet.id` is the
+/// website, and a second app is expected. One host means one
+/// `apple-app-site-association` file shared by every app on it, with their path
+/// patterns partitioned inside it — so two apps would have to coordinate a
+/// single file across two release cycles, and a mistake there routes links to
+/// the wrong app or breaks both. A host per app removes that entirely, and
+/// keeps a website deploy from silently breaking app links.
+pub const LINK_HOST: &str = "app.vaulet.id";
 const VERSION: u8 = 2;
 
 /// Compressed P-256 points are always this long, so carrying a length for them
@@ -143,14 +156,34 @@ pub fn encode(invitation: &Invitation, default_mediator: &str) -> Result<String>
     Ok(format!("{SCHEME}{}", B64.encode(body)))
 }
 
+/// Strip a link wrapper if there is one.
+///
+/// A code travels two ways and they are deliberately different. A **QR holds
+/// the short form**, because every character is modules a camera has to
+/// resolve. A **shared link holds the same string after a `#`**, so it is
+/// tappable in any messenger — and the fragment is the point: browsers never
+/// send it, so somebody without the app who taps the link does not hand our
+/// server the card they were given.
+pub fn unwrap_link(text: &str) -> &str {
+    let text = text.trim();
+    match text.rsplit_once('#') {
+        Some((_, payload)) => payload,
+        None => text,
+    }
+}
+
+/// Wrap a code as a link to share as text. The QR keeps the short form.
+pub fn share_link(code: &str) -> String {
+    format!("https://{LINK_HOST}/c#{code}")
+}
+
 /// Decode a scanned or pasted invitation.
 ///
 /// This is the one place in the chat code that meets input chosen by a
 /// stranger, so every length is checked and nothing is trusted to be
 /// well-formed.
 pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
-    let encoded = text
-        .trim()
+    let encoded = unwrap_link(text)
         .strip_prefix(SCHEME)
         .ok_or(ChatError::Malformed("not a vaulet invitation"))?;
     let body = B64
@@ -286,6 +319,26 @@ mod tests {
             encode(&card(), DEFAULT_MEDIATOR).unwrap().len()
                 < encode(&introduction(), DEFAULT_MEDIATOR).unwrap().len()
         );
+    }
+
+    /// The two ways a code travels must mean the same thing.
+    #[test]
+    fn a_card_wrapped_in_a_link_decodes_the_same() {
+        let bare = encode(&card(), DEFAULT_MEDIATOR).unwrap();
+        let link = share_link(&bare);
+
+        assert!(link.starts_with("https://app.vaulet.id/"));
+        assert!(link.contains('#'), "the payload must sit in the fragment");
+        assert_eq!(decode(&link, DEFAULT_MEDIATOR).unwrap(), card());
+    }
+
+    /// The fragment is not decoration: browsers never send it, so a link tapped
+    /// by somebody without the app tells our server nothing about the card.
+    #[test]
+    fn the_link_keeps_the_payload_out_of_the_path() {
+        let link = share_link(&encode(&card(), DEFAULT_MEDIATOR).unwrap());
+        let (before, _) = link.split_once('#').unwrap();
+        assert!(!before.contains("vlt:i:"));
     }
 
     #[test]
