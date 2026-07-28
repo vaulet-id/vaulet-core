@@ -20,9 +20,10 @@
 //!   deterministic rule. That rule is not chosen yet, which is why this module
 //!   supports groups of two and leaves larger groups to follow.
 
+pub mod inbox;
 mod state;
 
-pub use state::KEY_LEN as STATE_KEY_LEN;
+pub use state::{derive_key_from_seed, KEY_LEN as STATE_KEY_LEN};
 
 use openmls::prelude::{tls_codec::*, *};
 use openmls_basic_credential::SignatureKeyPair;
@@ -182,7 +183,13 @@ impl Session {
 
     /// A published key package is what lets someone add this device to a group
     /// while it is asleep — the reason inboxes can hold an invitation at all.
-    pub fn key_package(&self) -> Result<Vec<u8>> {
+    ///
+    /// Takes `&mut self` because it **writes**: the matching private init key
+    /// goes into the store, and a caller who publishes the package without
+    /// persisting the state afterwards will be unable to open the Welcome that
+    /// comes back. Interior mutability would have let this compile as `&self`
+    /// and hidden that.
+    pub fn key_package(&mut self) -> Result<Vec<u8>> {
         let bundle = KeyPackage::builder()
             .build(
                 CIPHERSUITE,
@@ -446,7 +453,7 @@ mod tests {
     #[test]
     fn a_tampered_key_package_is_refused() {
         let mut alice = Session::new(b"did:peer:alice").unwrap();
-        let bob = Session::new(b"did:peer:bob").unwrap();
+        let mut bob = Session::new(b"did:peer:bob").unwrap();
         let group = alice.create_group().unwrap();
 
         // Corrupt the last byte, which lands in the signature. Validation must

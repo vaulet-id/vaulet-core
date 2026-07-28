@@ -18,9 +18,17 @@ use std::collections::HashMap;
 
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use hkdf::Hkdf;
 use rand_core::RngCore as _;
+use sha2::Sha256;
 
 use super::{ChatError, Result};
+
+/// Domain separation for the chat-state key. Any other key derived from the
+/// same seed must use a different label, so that compromising one never
+/// compromises another; the version suffix leaves room to rotate without
+/// colliding with keys already in the field.
+const STATE_KEY_INFO: &[u8] = b"vaulet/chat/state/v1";
 
 /// XChaCha20 nonce, matching [`crate::recovery`] so the wallet has one AEAD.
 const NONCE_LEN: usize = 24;
@@ -95,6 +103,22 @@ fn decode(mut bytes: &[u8]) -> Result<Snapshot> {
         signer_public,
         values,
     })
+}
+
+/// Derive the chat-state key from the wallet seed (RFC 5869 HKDF-SHA256).
+///
+/// The platform therefore manages **no new key material**: the seed already
+/// lives in the Keychain as `ThisDeviceOnly` under ADR 0008, and this key
+/// inherits that protection rather than inventing a second thing to lose. It is
+/// derived per call and never stored — losing the seed loses the conversations,
+/// which is the same trade the rest of the wallet already makes.
+pub fn derive_key_from_seed(seed: &[u8]) -> [u8; KEY_LEN] {
+    let mut key = [0u8; KEY_LEN];
+    Hkdf::<Sha256>::new(None, seed)
+        .expand(STATE_KEY_INFO, &mut key)
+        // Only fails for absurd output lengths; 32 bytes from SHA-256 cannot.
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    key
 }
 
 pub fn seal(key: &[u8; KEY_LEN], snapshot: &Snapshot) -> Result<Vec<u8>> {
