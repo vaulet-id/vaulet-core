@@ -20,6 +20,10 @@
 //!   deterministic rule. That rule is not chosen yet, which is why this module
 //!   supports groups of two and leaves larger groups to follow.
 
+mod state;
+
+pub use state::KEY_LEN as STATE_KEY_LEN;
+
 use openmls::prelude::{tls_codec::*, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -39,6 +43,12 @@ pub enum ChatError {
     Malformed(&'static str),
     #[error("no such group")]
     NoSuchGroup,
+    /// Named rather than reported as corruption, so an older build tells the
+    /// user to update instead of telling them their data is broken.
+    #[error("sealed state is version {0}, which this build cannot read")]
+    UnsupportedStateVersion(u8),
+    #[error("wrong key for this sealed state")]
+    WrongStateKey,
 }
 
 pub type Result<T> = std::result::Result<T, ChatError>;
@@ -82,6 +92,7 @@ pub struct Session {
     provider: OpenMlsRustCrypto,
     signer: SignatureKeyPair,
     credential: CredentialWithKey,
+    identity: Vec<u8>,
 }
 
 impl Session {
@@ -103,6 +114,69 @@ impl Session {
             provider,
             signer,
             credential,
+            identity: identity.to_vec(),
+        })
+    }
+
+    /// Seal this session's whole state for the platform to store.
+    ///
+    /// Unlike the seed, MLS state **cannot be re-derived** — it holds the
+    /// ratchet, so losing it loses every conversation. The core still writes
+    /// nothing itself: it returns opaque bytes, and the platform holds both
+    /// them and the key (an Enclave-wrapped one, per ADR 0008/0013).
+    ///
+    /// Called after any operation that changes state, which in practice is
+    /// every send, receive and membership change.
+    pub fn export(&self, key: &[u8; STATE_KEY_LEN]) -> Result<Vec<u8>> {
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| ChatError::Mls("storage lock poisoned".into()))?
+            .clone();
+
+        state::seal(
+            key,
+            &state::Snapshot {
+                identity: self.identity.clone(),
+                signer_public: self.signer.to_public_vec(),
+                values,
+            },
+        )
+    }
+
+    /// Rebuild a session from sealed bytes. The conversation resumes at exactly
+    /// the epoch it was sealed at — messages that arrived meanwhile still open.
+    pub fn restore(key: &[u8; STATE_KEY_LEN], sealed: &[u8]) -> Result<Self> {
+        let snapshot = state::open(key, sealed)?;
+
+        let provider = OpenMlsRustCrypto::default();
+        *provider
+            .storage()
+            .values
+            .write()
+            .map_err(|_| ChatError::Mls("storage lock poisoned".into()))? = snapshot.values;
+
+        // The signature key is read back out of the restored store rather than
+        // carried separately, so there is one copy of it and no way for the two
+        // to drift apart.
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            &snapshot.signer_public,
+            SIGNATURE_SCHEME,
+        )
+        .ok_or(ChatError::Malformed("signature key missing from state"))?;
+
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(snapshot.identity.clone()).into(),
+            signature_key: snapshot.signer_public.into(),
+        };
+        Ok(Self {
+            provider,
+            signer,
+            credential,
+            identity: snapshot.identity,
         })
     }
 
@@ -390,6 +464,96 @@ mod tests {
         assert!(matches!(
             alice.send(b"not-a-group", b"hello"),
             Err(ChatError::NoSuchGroup)
+        ));
+    }
+
+    const KEY: &[u8; STATE_KEY_LEN] = b"an enclave-wrapped 32 byte key!!";
+
+    /// The point of sealing: a device that was closed and reopened resumes the
+    /// same conversation. Bob speaks *after* the export, so the ratchet state
+    /// has to have survived — merely restoring old messages would not do it.
+    #[test]
+    fn a_restored_session_continues_the_same_conversation() {
+        let (alice, mut bob, group) = pair();
+
+        let sealed = alice.export(KEY).unwrap();
+        drop(alice); // the app was closed
+
+        let mut alice = Session::restore(KEY, &sealed).unwrap();
+
+        let wire = bob
+            .send(&group, b"sent after alice closed the app")
+            .unwrap();
+        match alice.receive(&wire).unwrap() {
+            Received::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"sent after alice closed the app")
+            }
+            other => panic!("expected an application message, got {other:?}"),
+        }
+
+        // And she can still speak, which needs her signature key back too.
+        let wire = alice.send(&group, b"still here").unwrap();
+        assert!(matches!(
+            bob.receive(&wire),
+            Ok(Received::Application { .. })
+        ));
+    }
+
+    #[test]
+    fn restoring_keeps_the_group_and_its_membership() {
+        let (alice, _bob, group) = pair();
+        let restored = Session::restore(KEY, &alice.export(KEY).unwrap()).unwrap();
+        assert_eq!(
+            restored.members(&group).unwrap(),
+            alice.members(&group).unwrap()
+        );
+    }
+
+    #[test]
+    fn sealed_state_does_not_leak_the_identity_it_holds() {
+        let (alice, _bob, _group) = pair();
+        let sealed = alice.export(KEY).unwrap();
+        assert!(
+            !sealed.windows(14).any(|w| w == b"did:peer:alice"),
+            "state at rest must reveal nothing without the key"
+        );
+    }
+
+    #[test]
+    fn the_wrong_key_opens_nothing() {
+        let (alice, _bob, _group) = pair();
+        let sealed = alice.export(KEY).unwrap();
+        let wrong = b"0123456789abcdef0123456789abcdef";
+        assert!(matches!(
+            Session::restore(wrong, &sealed),
+            Err(ChatError::WrongStateKey)
+        ));
+    }
+
+    #[test]
+    fn tampered_sealed_state_is_refused_rather_than_half_loaded() {
+        let (alice, _bob, _group) = pair();
+        let mut sealed = alice.export(KEY).unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xff;
+        // The AEAD catches this before a single byte reaches the decoder, so a
+        // corrupt store can never be partially applied.
+        assert!(matches!(
+            Session::restore(KEY, &sealed),
+            Err(ChatError::WrongStateKey)
+        ));
+    }
+
+    /// A blob written by a newer build must say so, not read as corruption —
+    /// the user is told to update rather than told their data is broken.
+    #[test]
+    fn a_future_state_version_is_refused_by_name() {
+        let (alice, _bob, _group) = pair();
+        let mut sealed = alice.export(KEY).unwrap();
+        sealed[0] = 99;
+        assert!(matches!(
+            Session::restore(KEY, &sealed),
+            Err(ChatError::UnsupportedStateVersion(99))
         ));
     }
 }
