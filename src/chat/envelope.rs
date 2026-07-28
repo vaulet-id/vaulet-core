@@ -82,9 +82,15 @@ pub fn keypair(seed: &[u8], index: u32) -> Result<(Vec<u8>, Vec<u8>)> {
     hkdf::Hkdf::<sha2::Sha256>::new(None, seed)
         .expand(&envelope_info(index), &mut ikm)
         .map_err(|_| ChatError::Mls("envelope key derivation".into()))?;
+    keypair_from_ikm(&ikm)
+}
 
+/// The same construction from key material derived elsewhere — used by
+/// [`super::handle`], whose keys hang off a different label but must be the
+/// same kind of key, opened by the same [`open`].
+pub fn keypair_from_ikm(ikm: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let pair = RustCrypto::default()
-        .derive_hpke_keypair(HPKE, &ikm)
+        .derive_hpke_keypair(HPKE, ikm)
         .map_err(|e| ChatError::Mls(format!("derive envelope key: {e}")))?;
     Ok((pair.public, pair.private.to_vec()))
 }

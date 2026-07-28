@@ -21,6 +21,7 @@
 //!   supports groups of two and leaves larger groups to follow.
 
 pub mod envelope;
+pub mod handle;
 pub mod inbox;
 pub mod invitation;
 mod state;
