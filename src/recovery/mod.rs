@@ -88,8 +88,21 @@ fn encrypt_with(secret: &str, passphrase: &str, m: u32, t: u32) -> Result<String
         nonce: STANDARD.encode(nonce),
         ct: STANDARD.encode(ct),
     };
-    serde_json::to_string(&envelope)
-        .map_err(|e| CoreError::Key(format!("serialize envelope: {e}")))
+    serde_json::to_string(&envelope).map_err(|e| CoreError::Key(format!("serialize envelope: {e}")))
+}
+
+/// Whether a stored value is a sealed envelope rather than a bare secret.
+///
+/// **The wallet must not record this fact anywhere else.** It once lived in
+/// `SharedPreferences` while the sealed seed lived in the iOS Keychain, and the
+/// two have different lifetimes: deleting the app takes the flag and leaves the
+/// seed. The app then believed a wallet existed with no PIN on it, offered to
+/// create one, and tried to read a sealed envelope as a raw seed. Asking the
+/// data what it is cannot drift from the data.
+pub fn is_sealed(value: &str) -> bool {
+    serde_json::from_str::<Envelope>(value.trim())
+        .map(|e| e.v == 1 && e.kdf == "argon2id")
+        .unwrap_or(false)
 }
 
 /// Encrypt a JWK/seed into a recovery-FILE envelope — strong params, because the
@@ -110,7 +123,10 @@ pub fn decrypt_backup(envelope: &str, passphrase: &str) -> Result<String> {
     let env: Envelope = serde_json::from_str(envelope)
         .map_err(|e| CoreError::Key(format!("parse backup file: {e}")))?;
     if env.v != 1 {
-        return Err(CoreError::Key(format!("unsupported backup version: {}", env.v)));
+        return Err(CoreError::Key(format!(
+            "unsupported backup version: {}",
+            env.v
+        )));
     }
 
     let salt = STANDARD
@@ -135,13 +151,32 @@ pub fn decrypt_backup(envelope: &str, passphrase: &str) -> Result<String> {
         .map_err(|_| CoreError::Key("wrong passphrase or corrupt backup file".into()))?;
     // Move `pt` into the String (no extra un-wiped copy). The returned secret is
     // the caller's to protect — the bridge holds it in a Zeroizing session.
-    String::from_utf8(pt)
-        .map_err(|e| CoreError::Key(format!("decrypted backup not utf8: {e}")))
+    String::from_utf8(pt).map_err(|e| CoreError::Key(format!("decrypted backup not utf8: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reinstall bug in one assertion: a PIN-sealed seed must be
+    /// recognisable as sealed from the value alone, because the flag that used
+    /// to say so lived in storage the app deletes while the seed lives in a
+    /// Keychain it does not.
+    #[test]
+    fn a_sealed_value_is_recognisable_without_being_told() {
+        let sealed = encrypt_pin("test test test", "123456").unwrap();
+        assert!(is_sealed(&sealed));
+    }
+
+    #[test]
+    fn a_bare_seed_is_not_mistaken_for_a_sealed_one() {
+        assert!(!is_sealed(
+            "legal winner thank year wave sausage worth useful"
+        ));
+        assert!(!is_sealed("{\"kty\":\"EC\",\"crv\":\"P-256\"}"));
+        assert!(!is_sealed(""));
+        assert!(!is_sealed("enc:v1:AAAA"));
+    }
 
     #[test]
     fn round_trips() {
