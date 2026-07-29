@@ -24,6 +24,7 @@ pub mod envelope;
 pub mod handle;
 pub mod inbox;
 pub mod invitation;
+pub mod message;
 mod state;
 
 pub use state::{
