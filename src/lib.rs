@@ -230,6 +230,33 @@ pub fn wallet_build_proof_jwt(
     Ok(proof.jwt)
 }
 
+/// Sign the fields a holder typed into a form (ADR 0014).
+///
+/// `claims` is the JSON object of answers, keyed by the form's JSON Schema
+/// property names. Signed rather than sent plain so the submission is
+/// non-repudiable (PLAN D7), and bound to the form owner and the presentation
+/// nonce so answers cannot be moved between requests.
+pub fn wallet_sign_form_claims(
+    secret: &str,
+    audience: &str,
+    nonce: &str,
+    iat: i64,
+    claims_json: &str,
+) -> Result<String> {
+    let key = load_secret_key(secret)?;
+    let claims: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(claims_json)
+            .map_err(|e| CoreError::Protocol(format!("form claims json: {e}")))?;
+    protocol::oid4vp::sign_form_claims(
+        audience,
+        nonce,
+        iat,
+        claims,
+        key.public_jwk()?,
+        &key,
+    )
+}
+
 /// Verify an ePassport read (ADR 0009): data-group integrity against EF.SOD, plus
 /// SOD signature / DSC→CSCA chain / Active Authentication (staged). `dgs` maps DG
 /// number → raw EF bytes; `csca` is the trust store (may be empty); `aa` is
