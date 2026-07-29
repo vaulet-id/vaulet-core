@@ -493,7 +493,7 @@ fn extract_iss(sd_jwt: &str) -> Result<String> {
 }
 
 /// Build a p256 ES256 verifying key from a public JWK.
-fn verifying_key_from_jwk(jwk: &Value) -> Result<VerifyingKey> {
+pub(crate) fn verifying_key_from_jwk(jwk: &Value) -> Result<VerifyingKey> {
     let public = p256::PublicKey::from_jwk_str(&jwk.to_string())
         .map_err(|e| CoreError::Credential(format!("issuer jwk parse: {e}")))?;
     Ok(VerifyingKey::from(&public))
