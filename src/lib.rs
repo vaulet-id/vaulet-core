@@ -130,11 +130,80 @@ pub fn wallet_export_backup(secret: &str, passphrase: &str) -> Result<String> {
 /// returned secret in the Keychain and derives the identity from it. A wrong
 /// passphrase or corrupt/garbage envelope fails before anything is stored.
 pub fn wallet_import_backup(envelope: &str, passphrase: &str) -> Result<String> {
-    let plain = recovery::decrypt_backup(envelope, passphrase)?;
-    let secret = plain.trim().to_string();
-    load_secret_key(&secret)?; // validate: must load as a seed or legacy jwk
-    Ok(secret)
+    Ok(wallet_import_vault(envelope, passphrase)?.secret)
 }
+
+/// Marks a backup that carries more than the key. Checked by name rather than
+/// by shape, because a legacy backup holds a JWK — which is also JSON, and
+/// would be misread by anything that guessed from the first character.
+const VAULT_MARKER: &str = "vaulet_backup";
+
+/// What a recovery file restores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vault {
+    /// The seed (or, for old files, the legacy JWK).
+    pub secret: String,
+    /// Everything else the wallet held, as the platform wrote it. Opaque here
+    /// on purpose: the core has no opinion about credential storage, and a
+    /// backup format that had to be taught about each new kind of card would go
+    /// stale the first time one was added.
+    ///
+    /// Empty for a file written before backups carried anything but the key.
+    pub contents: String,
+}
+
+/// Encrypt the wallet **and what it holds** into one recovery file (PLAN.md D3).
+///
+/// A seed restores an identity. It does not restore credentials: those were
+/// issued to it, are held only on the device, and are gone when the app is
+/// deleted — which is a wallet that loses everything in it while insisting the
+/// keys are safe. So a backup carries them too.
+///
+/// The envelope is the same one [`wallet_export_backup`] writes, with a
+/// structured payload inside, so **an older build still opens a newer file** as
+/// far as the key is concerned. That matters: a recovery file is opened on the
+/// worst day somebody has, often on a device that has not been updated.
+pub fn wallet_export_vault(secret: &str, contents: &str, passphrase: &str) -> Result<String> {
+    let payload = serde_json::json!({
+        VAULT_MARKER: 1,
+        "secret": secret.trim(),
+        "contents": contents,
+    });
+    recovery::encrypt_backup(&payload.to_string(), passphrase)
+}
+
+/// Open a recovery file of either shape.
+pub fn wallet_import_vault(envelope: &str, passphrase: &str) -> Result<Vault> {
+    let plain = recovery::decrypt_backup(envelope, passphrase)?;
+
+    let vault = match serde_json::from_str::<serde_json::Value>(&plain) {
+        Ok(doc) if doc.get(VAULT_MARKER).is_some() => Vault {
+            secret: doc
+                .get("secret")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| CoreError::Key("backup has no secret".into()))?
+                .trim()
+                .to_string(),
+            contents: doc
+                .get("contents")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        // Anything else is a file from before this format — including a legacy
+        // JWK, which parses as JSON and must not be mistaken for a vault.
+        _ => Vault {
+            secret: plain.trim().to_string(),
+            contents: String::new(),
+        },
+    };
+
+    // Validated before anything is stored: a file that does not hold a usable
+    // seed must fail here rather than half-restore a wallet.
+    load_secret_key(&vault.secret)?;
+    Ok(vault)
+}
+
 
 /// Validate a 24-word recovery phrase and return it as the wallet secret
 /// (seed-first, ADR 0008). A bad word, wrong length, or failed checksum errors.
@@ -372,6 +441,49 @@ mod tests {
         let restored = wallet_import_backup(&envelope, "hunter2").unwrap();
         assert_eq!(restored, secret);
         assert_eq!(wallet_identity(&restored).unwrap().did, id.did);
+    }
+
+    /// The whole point: a restore that returns the identity but not what was
+    /// issued to it is a wallet that lost everything in it.
+    #[test]
+    fn a_backup_carries_the_credentials_as_well_as_the_key() {
+        let (secret, id) = new_wallet();
+        let held = r#"{"credentials":[{"vct":"employee-badge"}]}"#;
+
+        let envelope = wallet_export_vault(&secret, held, "hunter2").unwrap();
+        let vault = wallet_import_vault(&envelope, "hunter2").unwrap();
+
+        assert_eq!(vault.secret, secret);
+        assert_eq!(vault.contents, held);
+        assert_eq!(wallet_identity(&vault.secret).unwrap().did, id.did);
+    }
+
+    /// A recovery file is opened on the worst day somebody has, often on a
+    /// device that has not been updated — so both directions have to work.
+    #[test]
+    fn an_old_backup_still_opens_and_a_new_one_still_yields_its_key() {
+        let (secret, _) = new_wallet();
+
+        let old = wallet_export_backup(&secret, "pw").unwrap();
+        let vault = wallet_import_vault(&old, "pw").unwrap();
+        assert_eq!(vault.secret, secret);
+        assert!(vault.contents.is_empty(), "there was nothing else in it");
+
+        let new = wallet_export_vault(&secret, "anything at all", "pw").unwrap();
+        assert_eq!(wallet_import_backup(&new, "pw").unwrap(), secret);
+    }
+
+    /// A legacy backup holds a JWK, which is also JSON. Guessing the format
+    /// from the first character would restore the string `{"kty":…}` as a
+    /// secret and lose the wallet.
+    #[test]
+    fn a_legacy_jwk_backup_is_not_mistaken_for_a_vault() {
+        let jwk = keys::software::SoftwareKey::generate().to_jwk_string();
+
+        let envelope = wallet_export_backup(&jwk, "pw").unwrap();
+        let vault = wallet_import_vault(&envelope, "pw").unwrap();
+        assert_eq!(vault.secret, jwk);
+        assert!(vault.contents.is_empty());
     }
 
     #[test]
