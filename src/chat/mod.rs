@@ -92,6 +92,29 @@ pub enum Received {
     /// A proposal awaiting a commit. Kept distinct from `GroupChanged` because
     /// nothing has taken effect yet.
     ProposalQueued { group_id: Vec<u8> },
+
+    /// The message could not be read, and **this is data rather than an
+    /// error**.
+    ///
+    /// Returning it as a failure meant one unreadable blob stopped the whole
+    /// catch-up: the caller never confirmed the delivery, the mediator handed
+    /// the same blob back next time, and every message behind it — in every
+    /// other conversation too — waited behind it forever, in silence.
+    ///
+    /// The epochs say which of two very different things happened, and they are
+    /// readable without decrypting anything:
+    ///
+    /// - **theirs > ours** — we missed a commit. Nothing they send from here on
+    ///   can be read, and no amount of waiting fixes it.
+    /// - **theirs == ours** — the ratchet disagrees within an epoch: a sender
+    ///   whose state rolled back, or a gap too wide for the key window.
+    /// - **theirs < ours** — an old message arriving late. Ordinary, and the
+    ///   only one of the three that is not a problem.
+    Undecryptable {
+        group_id: Vec<u8>,
+        theirs: u64,
+        ours: u64,
+    },
 }
 
 /// A commit plus the Welcome that lets the new member join. Both must reach
@@ -324,10 +347,23 @@ impl Session {
             .map_err(|_| ChatError::Malformed("not a protocol message"))?;
 
         let group_id = message.group_id().as_slice().to_vec();
+        let theirs = message.epoch().as_u64();
         let mut group = self.load(&group_id)?;
-        let processed = group
-            .process_message(&self.provider, message)
-            .map_err(mls)?;
+        let ours = group.epoch().as_u64();
+
+        let processed = match group.process_message(&self.provider, message) {
+            Ok(processed) => processed,
+            // Reported rather than raised: see `Received::Undecryptable`. The
+            // epochs are captured above, from the message header, which is
+            // readable whether or not the body can be opened.
+            Err(_) => {
+                return Ok(Received::Undecryptable {
+                    group_id,
+                    theirs,
+                    ours,
+                })
+            }
+        };
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(m) => Ok(Received::Application {
@@ -485,8 +521,15 @@ mod tests {
         bob.receive(&commit).unwrap();
 
         let wire = alice.send(&group, b"after").unwrap();
+        // Unreadable is now reported rather than raised, so the assertion is on
+        // what came back rather than on it having failed — and it is the
+        // stronger statement: there is no plaintext, whatever the shape of the
+        // answer.
         assert!(
-            bob.receive(&wire).is_err(),
+            matches!(
+                bob.receive(&wire),
+                Ok(Received::Undecryptable { .. }) | Err(_)
+            ),
             "a removed member must not be able to decrypt a later message"
         );
     }
