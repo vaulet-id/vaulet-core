@@ -34,6 +34,19 @@ pub const CHAT: &str = "https://vaulet.id/chat/1.0/message";
 pub const TYPING: &str = "https://vaulet.id/chat/1.0/typing";
 /// Delivered, or read. Batched: one carries many ids.
 pub const RECEIPT: &str = "https://vaulet.id/chat/1.0/receipt";
+/// Take back messages that were sent — by id, batched like a receipt.
+///
+/// **A request, not a deletion.** It reaches the recipient's device and asks it
+/// to forget; a client that ignores it keeps the message, and nothing here can
+/// tell. The sender's own copy goes immediately, which is the only part either
+/// end controls.
+///
+/// It is worth offering anyway, because the case it is for is the one where the
+/// message is still sitting undelivered in an inbox: the retract arrives behind
+/// it in the same queue, and both are read in order, so the message is dropped
+/// before it was ever shown to anybody.
+pub const RETRACT: &str = "https://vaulet.id/chat/1.0/retract";
+
 /// What somebody calls themselves, and what they look like.
 ///
 /// **Self-asserted, and nothing here checks it.** Anyone can send any name, so
