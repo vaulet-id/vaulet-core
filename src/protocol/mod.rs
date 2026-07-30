@@ -669,6 +669,80 @@ pub mod oid4vp {
         pub claims: Vec<String>,
     }
 
+    /// A DCQL query — the standard way to ask for credentials (OID4VP 1.0 §6).
+    ///
+    /// DCQL is the only query language OID4VP 1.0 supports: Presentation
+    /// Exchange was removed at Draft 26, so a `presentation_definition` today
+    /// speaks a dialect the specification has left behind. Everything the form
+    /// engine asks for is expressed here so a verifier or wallet built against
+    /// the standard reads it without knowing anything about Vaulet.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct DcqlQuery {
+        /// Non-empty; one entry per credential the form requires.
+        pub credentials: Vec<DcqlCredentialQuery>,
+    }
+
+    /// One credential the query asks for (OID4VP 1.0 §6.1).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct DcqlCredentialQuery {
+        /// Identifies this credential in the response. Alphanumerics, `_` and
+        /// `-` only, per the specification.
+        pub id: String,
+        /// `dc+sd-jwt` for everything issued here — the identifier OID4VP 1.0
+        /// uses for SD-JWT VC.
+        pub format: String,
+        /// Format-specific matching rules; for SD-JWT VC, which `vct` values are
+        /// acceptable.
+        pub meta: DcqlMeta,
+        /// The claims that must be disclosed. Each `path` is a claims path
+        /// pointer: for a JSON credential, the property names to walk.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub claims: Vec<DcqlClaim>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct DcqlMeta {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub vct_values: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct DcqlClaim {
+        pub path: Vec<String>,
+    }
+
+    impl DcqlQuery {
+        /// Build the query for a set of (vct, claims) requirements.
+        ///
+        /// The `id` is derived from the vct's last segment because DCQL restricts
+        /// it to alphanumerics, `_` and `-` — a vct is a URL and cannot be used
+        /// as one.
+        pub fn for_credentials(reqs: &[RequestedCredential]) -> Self {
+            DcqlQuery {
+                credentials: reqs
+                    .iter()
+                    .map(|r| DcqlCredentialQuery {
+                        id: r
+                            .vct
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&r.vct)
+                            .chars()
+                            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                            .collect(),
+                        format: "dc+sd-jwt".to_string(),
+                        meta: DcqlMeta { vct_values: vec![r.vct.clone()] },
+                        claims: r
+                            .claims
+                            .iter()
+                            .map(|c| DcqlClaim { path: vec![c.clone()] })
+                            .collect(),
+                    })
+                    .collect(),
+            }
+        }
+    }
+
     /// What a Form asks for before it will issue its output (the OID4VP ask).
     /// The form owner mints it at `POST /api/v1/forms/{form_id}/presentation-request`
     /// (minting a fresh single-use `nonce` the way the token endpoint mints
@@ -680,7 +754,16 @@ pub mod oid4vp {
         pub form_id: String,
         /// Each required input credential + the claims to disclose. The wallet
         /// returns exactly one VP per entry (see [`SatisfyRequest::presentations`]).
+        ///
+        /// **Superseded by [`Self::dcql_query`]**, which says the same thing in
+        /// the standard's language. Kept while a shipped wallet still reads it;
+        /// new readers should use the query.
         pub required: Vec<RequestedCredential>,
+        /// The same ask as a DCQL query (OID4VP 1.0 §6) — the standard shape,
+        /// readable by any wallet built against the specification rather than
+        /// against this server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub dcql_query: Option<DcqlQuery>,
         /// Fresh, single-use challenge the form owner minted and stored server
         /// side with a short TTL. Every VP's KB-JWT must echo it as `nonce`, and
         /// it is replayed in [`SatisfyRequest::nonce`] so the verifier can bind
@@ -839,6 +922,43 @@ pub mod oid4vp {
         use super::*;
         use serde_json::json;
 
+        /// The query the form engine builds is a legal DCQL query.
+        ///
+        /// Pinned here because the parts the specification constrains are the
+        /// parts easiest to get subtly wrong: the id alphabet, the SD-JWT VC
+        /// format identifier (`dc+sd-jwt`, not the drafts' `vc+sd-jwt`), and
+        /// claims as path pointers rather than bare names.
+        #[test]
+        fn a_dcql_query_is_built_the_way_the_specification_describes() {
+            let q = DcqlQuery::for_credentials(&[RequestedCredential {
+                vct: "https://issuer.example/credential/verified_email".into(),
+                claims: vec!["email".into()],
+            }]);
+            let c = &q.credentials[0];
+
+            assert_eq!(c.format, "dc+sd-jwt");
+            assert_eq!(c.meta.vct_values, ["https://issuer.example/credential/verified_email"]);
+            assert_eq!(c.claims[0].path, ["email"]);
+            // A vct is a URL and cannot be an id, so one is derived that fits
+            // the alphabet DCQL allows.
+            assert_eq!(c.id, "verified_email");
+            assert!(c
+                .id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'));
+        }
+
+        /// A vct whose last segment carries characters DCQL forbids still
+        /// yields a legal id, rather than one a conformant verifier rejects.
+        #[test]
+        fn an_awkward_vct_still_yields_a_legal_identifier() {
+            let q = DcqlQuery::for_credentials(&[RequestedCredential {
+                vct: "https://issuer.example/credential/org.icao.epassport".into(),
+                claims: vec![],
+            }]);
+            assert_eq!(q.credentials[0].id, "org_icao_epassport");
+        }
+
         #[test]
         fn presentation_request_serde_and_required_vcts() {
             let req = PresentationRequest {
@@ -853,6 +973,7 @@ pub mod oid4vp {
                         claims: vec!["phone".into()],
                     },
                 ],
+                dcql_query: None,
                 nonce: "vp-nonce-123".into(),
                 audience: "https://issuer.example".into(),
             };
