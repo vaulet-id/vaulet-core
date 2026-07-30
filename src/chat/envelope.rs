@@ -58,6 +58,15 @@ pub enum Kind {
     /// and it travels sealed rather than in the clear so the mediator does not
     /// learn which two inboxes belong together.
     Introduction = 3,
+    /// What the sender calls themselves, and their picture.
+    ///
+    /// Outside MLS because it has to work before a room exists — a knock
+    /// answered with a profile, or a picture that arrives with an introduction.
+    /// **So it is not MLS-authenticated**: it is attributed to whoever owns the
+    /// inbox it landed in, the same trust the introduction beside it already
+    /// rests on. That is enough for a label nobody checks anyway (ADR 0015),
+    /// and is why nothing here may ever carry anything that is checked.
+    Profile = 4,
 }
 
 impl Kind {
@@ -66,6 +75,7 @@ impl Kind {
             1 => Ok(Kind::Welcome),
             2 => Ok(Kind::MlsMessage),
             3 => Ok(Kind::Introduction),
+            4 => Ok(Kind::Profile),
             _ => Err(ChatError::Malformed("unknown envelope kind")),
         }
     }
