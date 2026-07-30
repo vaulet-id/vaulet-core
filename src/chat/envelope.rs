@@ -67,6 +67,19 @@ pub enum Kind {
     /// rests on. That is enough for a label nobody checks anyway (ADR 0015),
     /// and is why nothing here may ever carry anything that is checked.
     Profile = 4,
+    /// The sender's invitation again, because the room between us has stopped
+    /// working.
+    ///
+    /// The payload is exactly an [`Kind::Introduction`], and the separate kind
+    /// is the whole point: an introduction says "here is where to reach me",
+    /// while this says "throw away the group we had and build another". A
+    /// re-introduction happens for ordinary reasons — moving mediator — and
+    /// must not tear a working room down.
+    ///
+    /// **A fresh key package is what makes this work at all.** MLS init keys are
+    /// consumed on joining, so the one already used to open the broken room can
+    /// never open a second: repair has to be an exchange, not a retry.
+    Repair = 5,
 }
 
 impl Kind {
@@ -76,6 +89,7 @@ impl Kind {
             2 => Ok(Kind::MlsMessage),
             3 => Ok(Kind::Introduction),
             4 => Ok(Kind::Profile),
+            5 => Ok(Kind::Repair),
             _ => Err(ChatError::Malformed("unknown envelope kind")),
         }
     }

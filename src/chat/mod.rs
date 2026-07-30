@@ -472,6 +472,34 @@ mod tests {
         (alice, bob, group)
     }
 
+    /// The premise repair rests on, pinned against OpenMLS rather than against
+    /// our reading of it: **a key package opens one room and no more.**
+    ///
+    /// Joining consumes the private init key, so a second Welcome built from
+    /// the same package is one the far end cannot open — and it fails at the
+    /// far end, silently, long after the sender thinks it worked. This is why
+    /// repairing a desynced conversation has to be an exchange of fresh
+    /// invitations and can never be a retry with what we already hold.
+    #[test]
+    fn a_key_package_cannot_open_a_second_room() {
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new(b"did:peer:bob").unwrap();
+        let key_package = bob.key_package().unwrap();
+
+        let first = alice.create_group().unwrap();
+        let to_first = alice.add_member(&first, &key_package).unwrap();
+        bob.join(&to_first.welcome).unwrap();
+
+        let second = alice.create_group().unwrap();
+        let to_second = alice.add_member(&second, &key_package).unwrap();
+
+        assert!(
+            bob.join(&to_second.welcome).is_err(),
+            "reusing a key package must fail here rather than produce a room \
+             one side cannot read"
+        );
+    }
+
     #[test]
     fn two_devices_exchange_messages_in_both_directions() {
         let (mut alice, mut bob, group) = pair();
