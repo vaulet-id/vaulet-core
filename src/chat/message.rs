@@ -34,6 +34,14 @@ pub const CHAT: &str = "https://vaulet.id/chat/1.0/message";
 pub const TYPING: &str = "https://vaulet.id/chat/1.0/typing";
 /// Delivered, or read. Batched: one carries many ids.
 pub const RECEIPT: &str = "https://vaulet.id/chat/1.0/receipt";
+/// What somebody calls themselves, and what they look like.
+///
+/// **Self-asserted, and nothing here checks it.** Anyone can send any name, so
+/// a recipient must never present this as an identity — it is a label its
+/// subject chose, and the thing that says who they are is still the key. The UI
+/// that shows it is responsible for keeping that distinction visible, and for
+/// letting the reader override it with a name they chose themselves.
+pub const PROFILE: &str = "https://vaulet.id/chat/1.0/profile";
 
 /// How old a typing signal may be before it is ignored.
 ///

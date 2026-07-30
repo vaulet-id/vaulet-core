@@ -55,7 +55,7 @@ const SCHEME: &str = "vlt:i:";
 /// the wrong app or breaks both. A host per app removes that entirely, and
 /// keeps a website deploy from silently breaking app links.
 pub const LINK_HOST: &str = "app.vaulet.id";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 
 /// Compressed P-256 points are always this long, so carrying a length for them
 /// spends four bytes saying what the version already says.
@@ -68,6 +68,36 @@ const FLAG_DEFAULT_MEDIATOR: u8 = 1 << 0;
 /// `flags` bit 1: a key package follows. Absent in a QR code, present in the
 /// sealed introduction.
 const FLAG_HAS_KEY_PACKAGE: u8 = 1 << 1;
+/// `flags` bit 2: a display name follows.
+const FLAG_HAS_NAME: u8 = 1 << 2;
+
+/// Caps on the display name, enforced here rather than trusted to the caller
+/// (ADR 0015).
+///
+/// **Both are needed.** A character count alone lets a Thai name cost three
+/// bytes each and an emoji four, so 24 "characters" could be 96 bytes or 24 —
+/// a fourfold difference in how much of the QR it eats, with nothing to warn
+/// anybody. The card is the one place in this system where size is a feature:
+/// it went from 986 characters to 97, and a name must not quietly give that
+/// back.
+pub const MAX_NAME_CHARS: usize = 24;
+pub const MAX_NAME_BYTES: usize = 96;
+
+/// Cut a display name down to what a card will carry, on a character boundary.
+///
+/// Truncating rather than refusing, because the alternative is a card that
+/// cannot be made at all because of a name — and the caller that let it get
+/// too long is a UI bug, not something the person holding the phone can act on.
+pub fn fit_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars().take(MAX_NAME_CHARS) {
+        if out.len() + c.len_utf8() > MAX_NAME_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// Everything one device needs to start talking to another.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +115,12 @@ pub struct Invitation {
 
     /// True when this carries enough to open a room, not merely to write once.
     pub has_key_package: bool,
+
+    /// What the holder should call them, chosen by them and checked by nobody.
+    /// Empty when unset. Rides in the card itself so somebody handed a code
+    /// sees a name with no reply from us — nothing confirms the code to
+    /// anybody, which is the property the private card path keeps (ADR 0015).
+    pub display_name: String,
 }
 
 /// P-256 points ride compressed: 33 bytes instead of 65, for the same key.
@@ -109,12 +145,30 @@ fn put(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// A one-byte length, for fields that are capped well under 256 bytes. Four
+/// bytes of length on a 30-byte name is four bytes of QR spent saying nothing.
+fn put_short(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(bytes.len() as u8);
+    out.extend_from_slice(bytes);
+}
+
 fn take_point<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
     let (point, rest) = bytes
         .split_at_checked(POINT_LEN)
         .ok_or(ChatError::Malformed("invitation"))?;
     *bytes = rest;
     Ok(point)
+}
+
+fn take_short<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let (&len, rest) = bytes
+        .split_first()
+        .ok_or(ChatError::Malformed("invitation"))?;
+    let (value, rest) = rest
+        .split_at_checked(len as usize)
+        .ok_or(ChatError::Malformed("invitation"))?;
+    *bytes = rest;
+    Ok(value)
 }
 
 fn take<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
@@ -142,6 +196,10 @@ pub fn encode(invitation: &Invitation, default_mediator: &str) -> Result<String>
     if invitation.has_key_package {
         flags |= FLAG_HAS_KEY_PACKAGE;
     }
+    let display_name = fit_name(&invitation.display_name);
+    if !display_name.is_empty() {
+        flags |= FLAG_HAS_NAME;
+    }
 
     let mut body = vec![VERSION, flags];
     if flags & FLAG_DEFAULT_MEDIATOR == 0 {
@@ -151,6 +209,9 @@ pub fn encode(invitation: &Invitation, default_mediator: &str) -> Result<String>
     body.extend_from_slice(&compress(&invitation.envelope_public_key)?);
     if invitation.has_key_package {
         put(&mut body, &invitation.key_package);
+    }
+    if !display_name.is_empty() {
+        put_short(&mut body, display_name.as_bytes());
     }
 
     Ok(format!("{SCHEME}{}", B64.encode(body)))
@@ -217,6 +278,18 @@ pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
         Vec::new()
     };
 
+    let display_name = if flags & FLAG_HAS_NAME != 0 {
+        // Input chosen by a stranger: it is only ever shown, never parsed, and
+        // it is cut to the cap here so a hand-made card cannot make a row of
+        // the UI arbitrarily long.
+        fit_name(
+            std::str::from_utf8(take_short(&mut rest)?)
+                .map_err(|_| ChatError::Malformed("invitation display name"))?,
+        )
+    } else {
+        String::new()
+    };
+
     if !rest.is_empty() {
         return Err(ChatError::Malformed("trailing invitation data"));
     }
@@ -232,6 +305,7 @@ pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
         envelope_public_key,
         has_key_package,
         key_package,
+        display_name,
     })
 }
 
@@ -261,6 +335,7 @@ mod tests {
             envelope_public_key: hex(POINT_A),
             key_package: Vec::new(),
             has_key_package: false,
+            display_name: String::new(),
         }
     }
 
@@ -278,6 +353,86 @@ mod tests {
             DEFAULT_MEDIATOR,
         )
         .unwrap()
+    }
+
+    /// The whole point of the name being in the card: it arrives with no reply
+    /// from us, so nothing confirms the code to whoever is holding it.
+    #[test]
+    fn a_card_carries_a_display_name() {
+        let named = Invitation {
+            display_name: "สมชาย ใจดี".into(),
+            ..card()
+        };
+        assert_eq!(round_trip(&named).display_name, "สมชาย ใจดี");
+    }
+
+    /// Both caps, because a character count alone lets Thai cost three bytes a
+    /// character and an emoji four — 24 "characters" is anywhere from 24 to 96
+    /// bytes, and the card is the one place where that difference is a feature
+    /// being spent.
+    #[test]
+    fn a_name_is_cut_to_both_caps() {
+        assert_eq!(fit_name(&"a".repeat(100)).chars().count(), MAX_NAME_CHARS);
+
+        let fitted = fit_name(&"🙂".repeat(100));
+        assert!(fitted.len() <= MAX_NAME_BYTES);
+        assert!(fitted.chars().count() <= MAX_NAME_CHARS);
+        assert!(
+            fitted.chars().next().is_some(),
+            "cutting is on a character boundary, never mid-codepoint"
+        );
+    }
+
+    /// A card made with an over-long name is still a valid card — the encoder
+    /// cuts it rather than refusing, because a name is not a reason to be
+    /// unable to hand somebody a code.
+    #[test]
+    fn an_over_long_name_shortens_the_card_rather_than_breaking_it() {
+        let shouting = Invitation {
+            display_name: "ก".repeat(200),
+            ..card()
+        };
+        assert_eq!(round_trip(&shouting).display_name.chars().count(), MAX_NAME_CHARS);
+    }
+
+    /// What the name costs, stated rather than assumed. A Thai name at the cap
+    /// takes the card from QR version 5 to about 8 — still readable across a
+    /// table, and this test is here so a future change that doubles it again
+    /// has to say so out loud.
+    #[test]
+    fn a_name_at_the_cap_keeps_the_card_scannable() {
+        let bare = encode(&card(), DEFAULT_MEDIATOR).unwrap();
+        let named = encode(
+            &Invitation {
+                display_name: "ก".repeat(MAX_NAME_CHARS),
+                ..card()
+            },
+            DEFAULT_MEDIATOR,
+        )
+        .unwrap();
+
+        assert!(bare.len() < 110, "the bare card stays tiny: {}", bare.len());
+        assert!(
+            named.len() < 240,
+            "a named card stays inside QR version 9: {}",
+            named.len()
+        );
+    }
+
+    /// Nothing is spent when nobody has set a name — the flag is the whole cost.
+    #[test]
+    fn a_nameless_card_is_no_bigger_than_before() {
+        assert_eq!(
+            encode(&card(), DEFAULT_MEDIATOR).unwrap(),
+            encode(
+                &Invitation {
+                    display_name: String::new(),
+                    ..card()
+                },
+                DEFAULT_MEDIATOR
+            )
+            .unwrap()
+        );
     }
 
     #[test]
