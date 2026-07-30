@@ -131,17 +131,32 @@ pub fn seal(recipient_public: &[u8], kind: Kind, payload: &[u8]) -> Result<Vec<u
     plaintext.push(kind as u8);
     plaintext.extend_from_slice(payload);
 
-    let sealed = RustCrypto::default()
-        .hpke_seal(HPKE, recipient_public, INFO, &[], &plaintext)
-        .map_err(|e| ChatError::Mls(format!("seal envelope: {e}")))?;
-
     let mut out = vec![VERSION];
-    out.extend_from_slice(
-        &sealed
-            .tls_serialize_detached()
-            .map_err(|e| ChatError::Mls(format!("serialize envelope: {e}")))?,
-    );
+    out.extend_from_slice(&seal_to(recipient_public, INFO, &plaintext)?);
     Ok(out)
+}
+
+/// The HPKE part on its own, so anything else sealing to a P-256 key uses this
+/// one configuration under **its own** `info` label rather than a second copy
+/// of the same three constants.
+///
+/// The label is not decoration: HPKE covers `info` in the key schedule, so a
+/// ciphertext made for one purpose cannot be replayed into another.
+pub(super) fn seal_to(recipient_public: &[u8], info: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+    RustCrypto::default()
+        .hpke_seal(HPKE, recipient_public, info, &[], plaintext)
+        .map_err(|e| ChatError::Mls(format!("seal: {e}")))?
+        .tls_serialize_detached()
+        .map_err(|e| ChatError::Mls(format!("serialize sealed: {e}")))
+}
+
+/// The other half of [`seal_to`].
+pub(super) fn open_from(recipient_private: &[u8], info: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
+    let ciphertext = HpkeCiphertext::tls_deserialize_exact(sealed)
+        .map_err(|_| ChatError::Malformed("sealed"))?;
+    RustCrypto::default()
+        .hpke_open(HPKE, &ciphertext, recipient_private, info, &[])
+        .map_err(|_| ChatError::NotForUs)
 }
 
 /// Open an envelope addressed to us. Fails for anything addressed to somebody
@@ -154,12 +169,7 @@ pub fn open(recipient_private: &[u8], sealed: &[u8]) -> Result<(Kind, Vec<u8>)> 
         return Err(ChatError::UnsupportedEnvelopeVersion(version));
     }
 
-    let ciphertext = HpkeCiphertext::tls_deserialize_exact(rest)
-        .map_err(|_| ChatError::Malformed("envelope"))?;
-
-    let plaintext = RustCrypto::default()
-        .hpke_open(HPKE, &ciphertext, recipient_private, INFO, &[])
-        .map_err(|_| ChatError::NotForUs)?;
+    let plaintext = open_from(recipient_private, INFO, rest)?;
 
     let (&kind, payload) = plaintext
         .split_first()
