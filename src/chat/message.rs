@@ -56,6 +56,33 @@ pub const RETRACT: &str = "https://vaulet.id/chat/1.0/retract";
 /// letting the reader override it with a name they chose themselves.
 pub const PROFILE: &str = "https://vaulet.id/chat/1.0/profile";
 
+/// "Something you sent never reached me — send it again."
+///
+/// A gap is the one failure this protocol cannot repair by waiting. A blob that
+/// could not be decrypted is dropped and confirmed, because not dropping it
+/// jams every conversation on the device behind one bad message — so the
+/// mediator forgets it, and nothing anywhere will produce it a second time. The
+/// reader is left with a hole and the sender with a bubble that never gets its
+/// tick.
+///
+/// **It names a time, not a message.** The whole point is that the receiver
+/// never saw what it lost, so it cannot name it: what it can say is when it
+/// last read something, which bounds what the sender needs to repeat.
+///
+/// Answering is a courtesy and not an obligation. A sender that no longer has
+/// the message, or is talking to somebody asking too often, simply does not —
+/// and the gap stays a gap, which is still better than a silence nobody
+/// noticed.
+pub const RESEND: &str = "https://vaulet.id/chat/1.0/resend";
+
+/// Most a sender will repeat in answer to one request.
+///
+/// A bound rather than a judgement about conversations: the request names a
+/// time, and a time can name an afternoon. Repeating an afternoon into a
+/// conversation that only lost one message would be a worse outcome than the
+/// gap.
+pub const MAX_RESEND: usize = 20;
+
 /// How old a typing signal may be before it is ignored.
 ///
 /// The mediator queues, so a signal sent by somebody who then went offline is
