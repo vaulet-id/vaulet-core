@@ -55,7 +55,7 @@ const SCHEME: &str = "vlt:i:";
 /// the wrong app or breaks both. A host per app removes that entirely, and
 /// keeps a website deploy from silently breaking app links.
 pub const LINK_HOST: &str = "app.vaulet.id";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 
 /// Compressed P-256 points are always this long, so carrying a length for them
 /// spends four bytes saying what the version already says.
@@ -70,6 +70,13 @@ const FLAG_DEFAULT_MEDIATOR: u8 = 1 << 0;
 const FLAG_HAS_KEY_PACKAGE: u8 = 1 << 1;
 /// `flags` bit 2: a display name follows.
 const FLAG_HAS_NAME: u8 = 1 << 2;
+/// `flags` bit 3: a push ticket follows (ADR 0016).
+///
+/// **Never in a QR code**, and that is not only about size. A ticket is handed
+/// to one person so they can wake this device; a photograph of a screen is not
+/// a person. It rides with the key package, in the sealed introduction, where
+/// it reaches somebody who has actually answered.
+const FLAG_HAS_PUSH_TICKET: u8 = 1 << 3;
 
 /// Caps on the display name, enforced here rather than trusted to the caller
 /// (ADR 0015).
@@ -115,6 +122,15 @@ pub struct Invitation {
 
     /// True when this carries enough to open a room, not merely to write once.
     pub has_key_package: bool,
+
+    /// The ticket a contact attaches to a deposit so the mediator can have this
+    /// device woken (ADR 0016). Opaque to everyone who carries it — only the
+    /// relay holds a key that opens it.
+    ///
+    /// Empty when this build has no push registration, which is the ordinary
+    /// case for somebody who declined notifications. A missing ticket means
+    /// messages arrive when they open the app, and nothing else changes.
+    pub push_ticket: Vec<u8>,
 
     /// What the holder should call them, chosen by them and checked by nobody.
     /// Empty when unset. Rides in the card itself so somebody handed a code
@@ -200,6 +216,9 @@ pub fn encode(invitation: &Invitation, default_mediator: &str) -> Result<String>
     if !display_name.is_empty() {
         flags |= FLAG_HAS_NAME;
     }
+    if !invitation.push_ticket.is_empty() {
+        flags |= FLAG_HAS_PUSH_TICKET;
+    }
 
     let mut body = vec![VERSION, flags];
     if flags & FLAG_DEFAULT_MEDIATOR == 0 {
@@ -212,6 +231,9 @@ pub fn encode(invitation: &Invitation, default_mediator: &str) -> Result<String>
     }
     if !display_name.is_empty() {
         put_short(&mut body, display_name.as_bytes());
+    }
+    if !invitation.push_ticket.is_empty() {
+        put_short(&mut body, &invitation.push_ticket);
     }
 
     Ok(format!("{SCHEME}{}", B64.encode(body)))
@@ -290,6 +312,12 @@ pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
         String::new()
     };
 
+    let push_ticket = if flags & FLAG_HAS_PUSH_TICKET != 0 {
+        take_short(&mut rest)?.to_vec()
+    } else {
+        Vec::new()
+    };
+
     if !rest.is_empty() {
         return Err(ChatError::Malformed("trailing invitation data"));
     }
@@ -306,6 +334,7 @@ pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
         has_key_package,
         key_package,
         display_name,
+        push_ticket,
     })
 }
 
@@ -336,6 +365,7 @@ mod tests {
             key_package: Vec::new(),
             has_key_package: false,
             display_name: String::new(),
+            push_ticket: Vec::new(),
         }
     }
 
@@ -562,6 +592,38 @@ mod tests {
             decode(&text, DEFAULT_MEDIATOR),
             Err(ChatError::Malformed(_))
         ));
+    }
+
+    /// The ticket travels with the key package, to somebody who answered — not
+    /// in a code a stranger can photograph off a screen.
+    #[test]
+    fn a_push_ticket_survives_the_introduction_it_rides_in() {
+        let ticket = vec![1u8, 0, 0, 0, 3, 9, 9, 9];
+        let mut introduction = introduction();
+        introduction.push_ticket = ticket.clone();
+
+        let text = encode(&introduction, DEFAULT_MEDIATOR).unwrap();
+        assert_eq!(decode(&text, DEFAULT_MEDIATOR).unwrap().push_ticket, ticket);
+    }
+
+    /// Somebody who declined notifications has no ticket, and that must be an
+    /// ordinary card rather than a special case anybody has to handle.
+    #[test]
+    fn no_ticket_is_a_card_like_any_other() {
+        let text = encode(&introduction(), DEFAULT_MEDIATOR).unwrap();
+        assert!(decode(&text, DEFAULT_MEDIATOR)
+            .unwrap()
+            .push_ticket
+            .is_empty());
+    }
+
+    /// The QR is the one place in this system where size is a feature — 97
+    /// characters, read at a glance. A ticket would nearly triple it, for
+    /// something the scanner cannot use until they have answered anyway.
+    #[test]
+    fn a_card_stays_short_whatever_the_introduction_carries() {
+        let card = encode(&card(), DEFAULT_MEDIATOR).unwrap();
+        assert!(card.len() < 120, "the card grew to {} characters", card.len());
     }
 
     #[test]
