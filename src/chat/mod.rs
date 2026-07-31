@@ -33,6 +33,7 @@ pub use state::{
     KEY_LEN as STATE_KEY_LEN,
 };
 
+use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::{tls_codec::*, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -79,6 +80,29 @@ fn mls<E: std::fmt::Display>(e: E) -> ChatError {
     ChatError::Mls(e.to_string())
 }
 
+/// Whether a message failed because we have already been past it.
+///
+/// Three distinct errors mean the same thing — the generation is behind the
+/// receiving ratchet — and all three are what a **second copy of a message we
+/// already read** looks like. That is not a rare event here: delivery is
+/// at-least-once, so the mediator hands a blob over again whenever a receiver
+/// has not confirmed storing it.
+///
+/// `TooDistantInTheFuture` is deliberately **not** in this list. It means
+/// messages between this one and the last are gone for good, which is a real
+/// loss and belongs in front of somebody.
+fn is_replay<S>(error: &ProcessMessageError<S>) -> bool {
+    matches!(
+        error,
+        ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+            MessageDecryptionError::GenerationOutOfBound
+                | MessageDecryptionError::SecretTreeError(
+                    SecretTreeError::TooDistantInThePast | SecretTreeError::SecretReuseError
+                )
+        ))
+    )
+}
+
 /// What arrived, once MLS has authenticated and decrypted it.
 #[derive(Debug)]
 pub enum Received {
@@ -115,6 +139,17 @@ pub enum Received {
         group_id: Vec<u8>,
         theirs: u64,
         ours: u64,
+        /// The same message a second time, or one older than the ratchet's
+        /// window — **within the current epoch**, where the epochs alone
+        /// cannot tell it from a genuine break.
+        ///
+        /// **This is the common case, not an edge case.** Delivery is
+        /// at-least-once by design: the mediator hands a blob over again
+        /// whenever a receiver has not confirmed storing it, and MLS refusing
+        /// the second copy is the ratchet doing its job. Reporting it as a
+        /// broken conversation put a red banner over a room that was working
+        /// perfectly, on the first message anybody sent.
+        replayed: bool,
     },
 }
 
@@ -357,11 +392,12 @@ impl Session {
             // Reported rather than raised: see `Received::Undecryptable`. The
             // epochs are captured above, from the message header, which is
             // readable whether or not the body can be opened.
-            Err(_) => {
+            Err(e) => {
                 return Ok(Received::Undecryptable {
                     group_id,
                     theirs,
                     ours,
+                    replayed: is_replay(&e),
                 })
             }
         };
@@ -422,7 +458,10 @@ impl Session {
             return Err(ChatError::Malformed("not a key package"));
         };
         let key_package = key_package
-            .validate(OpenMlsRustCrypto::default().crypto(), ProtocolVersion::Mls10)
+            .validate(
+                OpenMlsRustCrypto::default().crypto(),
+                ProtocolVersion::Mls10,
+            )
             .map_err(mls)?;
         Ok(key_package
             .leaf_node()
@@ -499,6 +538,45 @@ mod tests {
             "reusing a key package must fail here rather than produce a room \
              one side cannot read"
         );
+    }
+
+    /// **The bug this exists to stop from coming back.** Delivery is
+    /// at-least-once: the mediator hands a blob over again whenever the
+    /// receiver has not confirmed storing it, so the same message arriving
+    /// twice is ordinary, expected, and by design.
+    ///
+    /// MLS refuses the second copy — which is the ratchet working — and the
+    /// refusal is indistinguishable, by epoch alone, from a conversation that
+    /// has genuinely broken. Reporting it as the latter put a red "this
+    /// conversation can no longer be read" banner over a working room on the
+    /// **first message anybody sent**.
+    ///
+    /// Which error OpenMLS returns is its decision, not ours: this asks it.
+    #[test]
+    fn the_same_message_twice_is_a_replay_and_not_a_broken_conversation() {
+        let (mut alice, mut bob, group) = pair();
+        let wire = alice.send(&group, b"hello").unwrap();
+
+        assert!(matches!(
+            bob.receive(&wire).unwrap(),
+            Received::Application { .. }
+        ));
+
+        match bob.receive(&wire).unwrap() {
+            Received::Undecryptable {
+                replayed,
+                theirs,
+                ours,
+                ..
+            } => {
+                assert!(replayed, "a second copy must not read as a break");
+                assert_eq!(
+                    theirs, ours,
+                    "and the epochs cannot tell it apart, which is the point"
+                );
+            }
+            other => panic!("expected the replay to be reported, got {other:?}"),
+        }
     }
 
     #[test]

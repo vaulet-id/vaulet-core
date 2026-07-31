@@ -422,7 +422,10 @@ mod tests {
             display_name: "ก".repeat(200),
             ..card()
         };
-        assert_eq!(round_trip(&shouting).display_name.chars().count(), MAX_NAME_CHARS);
+        assert_eq!(
+            round_trip(&shouting).display_name.chars().count(),
+            MAX_NAME_CHARS
+        );
     }
 
     /// What the name costs, stated rather than assumed. A Thai name at the cap
@@ -623,7 +626,11 @@ mod tests {
     #[test]
     fn a_card_stays_short_whatever_the_introduction_carries() {
         let card = encode(&card(), DEFAULT_MEDIATOR).unwrap();
-        assert!(card.len() < 120, "the card grew to {} characters", card.len());
+        assert!(
+            card.len() < 120,
+            "the card grew to {} characters",
+            card.len()
+        );
     }
 
     #[test]
