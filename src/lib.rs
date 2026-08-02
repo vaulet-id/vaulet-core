@@ -305,6 +305,44 @@ pub fn wallet_build_proof_jwt(
     Ok(proof.jwt)
 }
 
+/// `typ` of a Studio sign-in JWT.
+///
+/// Shared with the server (`studio_auth::SIGNIN_JWT_TYP`) rather than written
+/// twice: they have to agree or every sign-in fails with "wrong proof typ" and
+/// nothing anywhere says why.
+pub const STUDIO_SIGNIN_JWT_TYP: &str = "vaulet-studio-signin+jwt";
+
+/// Sign a Studio sign-in challenge.
+///
+/// The same ES256 signature over the same `aud` + `nonce` as an issuance proof,
+/// under a **different `typ`**. Audience and nonce already stop either being
+/// replayed as the other; the separate typ means a reader learns what a
+/// signature was for from one field rather than three, and lets the server
+/// refuse an issuance proof offered as a sign-in.
+pub fn wallet_build_signin_jwt(
+    secret: &str,
+    audience: &str,
+    nonce: &str,
+    iat: i64,
+) -> Result<String> {
+    use protocol::oid4vci::{build_proof_jwt, ProofJwtClaims, ProofJwtHeader};
+    let key = load_secret_key(secret)?;
+    let header = ProofJwtHeader {
+        typ: STUDIO_SIGNIN_JWT_TYP.to_string(),
+        alg: "ES256".to_string(),
+        jwk: Some(key.public_jwk()?),
+        kid: None,
+    };
+    let claims = ProofJwtClaims {
+        iss: None,
+        aud: audience.to_string(),
+        iat,
+        nonce: nonce.to_string(),
+        cb: None,
+    };
+    build_proof_jwt(&header, &claims, &key)
+}
+
 /// Sign the fields a holder typed into a form (ADR 0014).
 ///
 /// `claims` is the JSON object of answers, keyed by the form's JSON Schema
