@@ -585,10 +585,7 @@ mod tests {
 
         let wire = alice.send(&group, b"prachum 6 mong").unwrap();
         match bob.receive(&wire).unwrap() {
-            Received::Application {
-                plaintext,
-                room_id,
-            } => {
+            Received::Application { plaintext, room_id } => {
                 assert_eq!(plaintext, b"prachum 6 mong");
                 assert_eq!(room_id, group);
             }
