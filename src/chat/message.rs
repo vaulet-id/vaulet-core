@@ -75,6 +75,29 @@ pub const PROFILE: &str = "https://vaulet.id/chat/1.0/profile";
 /// noticed.
 pub const RESEND: &str = "https://vaulet.id/chat/1.0/resend";
 
+/// "This is the box to write to for me, in this room."
+///
+/// A room's members may never have met, so there is no per-contact inbox
+/// between them and none may be invented from a relationship that does not
+/// exist (ADR 0022). Each member derives one box per room and says so here.
+///
+/// **Sent inside the room**, which is why it is a message kind rather than an
+/// envelope kind: it is encrypted to the members, so the mediator is never told
+/// which addresses belong to one room. It would learn that from a fan-out
+/// endpoint, which is exactly the endpoint ADR 0018 forbids.
+///
+/// Sent on joining, and repeated whenever the membership changes — a member who
+/// joined after somebody's announcement would otherwise never learn where to
+/// write to them, and would silently leave them out of every message.
+pub const ROOM_ADDRESS: &str = "https://vaulet.id/chat/1.0/room-address";
+
+/// What a room is called, decided by whoever created it.
+///
+/// Self-asserted like a display name (ADR 0015) and carried in the room so that
+/// everybody sees the same thing. A member may still keep a private name for
+/// the room; that one never leaves their device.
+pub const ROOM_NAME: &str = "https://vaulet.id/chat/1.0/room-name";
+
 /// Most a sender will repeat in answer to one request.
 ///
 /// A bound rather than a judgement about conversations: the request names a
@@ -152,6 +175,29 @@ impl Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatBody {
     pub content: String,
+}
+
+/// The body of [`ROOM_ADDRESS`] — where to write to one member of a room.
+///
+/// The key travels with the address for the same reason a deposit carries it
+/// (ADR 0018): the box may not exist yet, and a sender holding the key can make
+/// it on the deposit that needs it rather than in a request of its own. It
+/// authorises nothing — the address is its hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomAddressBody {
+    /// `base64url(sha256(public_key))`, the same construction as every other
+    /// identifier here.
+    pub inbox: String,
+    /// SEC1-uncompressed, base64url.
+    pub public_key: String,
+    /// Which mediator holds it. Members may be on different ones.
+    pub mediator: String,
+}
+
+/// The body of [`ROOM_NAME`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomNameBody {
+    pub name: String,
 }
 
 /// The body of [`RECEIPT`].
