@@ -108,15 +108,15 @@ fn is_replay<S>(error: &ProcessMessageError<S>) -> bool {
 pub enum Received {
     /// A message someone sent to the group.
     Application {
-        group_id: Vec<u8>,
+        room_id: Vec<u8>,
         plaintext: Vec<u8>,
     },
     /// A membership or key change that has been applied. The epoch has moved,
     /// so any key an ex-member held is now useless.
-    GroupChanged { group_id: Vec<u8> },
-    /// A proposal awaiting a commit. Kept distinct from `GroupChanged` because
+    RoomChanged { room_id: Vec<u8> },
+    /// A proposal awaiting a commit. Kept distinct from `RoomChanged` because
     /// nothing has taken effect yet.
-    ProposalQueued { group_id: Vec<u8> },
+    ProposalQueued { room_id: Vec<u8> },
 
     /// The message could not be read, and **this is data rather than an
     /// error**.
@@ -136,7 +136,7 @@ pub enum Received {
     /// - **theirs < ours** — an old message arriving late. Ordinary, and the
     ///   only one of the three that is not a problem.
     Undecryptable {
-        group_id: Vec<u8>,
+        room_id: Vec<u8>,
         theirs: u64,
         ours: u64,
         /// The same message a second time, or one older than the ratchet's
@@ -285,7 +285,7 @@ impl Session {
     /// Create a group containing only this device. A one-to-one conversation is
     /// a group of two, so there is no separate pairwise code path to keep in
     /// step with the group one.
-    pub fn create_group(&mut self) -> Result<Vec<u8>> {
+    pub fn create_room(&mut self) -> Result<Vec<u8>> {
         let group = MlsGroup::new(
             &self.provider,
             &self.signer,
@@ -306,7 +306,7 @@ impl Session {
         Ok(group.group_id().as_slice().to_vec())
     }
 
-    pub fn add_member(&mut self, group_id: &[u8], key_package: &[u8]) -> Result<Invitation> {
+    pub fn add_member(&mut self, room_id: &[u8], key_package: &[u8]) -> Result<Invitation> {
         let body = MlsMessageIn::tls_deserialize_exact(key_package)
             .map_err(|_| ChatError::Malformed("key package"))?
             .extract();
@@ -320,7 +320,7 @@ impl Session {
             .validate(self.provider.crypto(), ProtocolVersion::Mls10)
             .map_err(mls)?;
 
-        let mut group = self.load(group_id)?;
+        let mut group = self.load(room_id)?;
         let (commit, welcome, _) = group
             .add_members(
                 &self.provider,
@@ -364,8 +364,8 @@ impl Session {
         Ok(group.group_id().as_slice().to_vec())
     }
 
-    pub fn send(&mut self, group_id: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut group = self.load(group_id)?;
+    pub fn send(&mut self, room_id: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let mut group = self.load(room_id)?;
         group
             .create_message(&self.provider, &self.signer, plaintext)
             .map_err(mls)?
@@ -382,9 +382,9 @@ impl Session {
             .try_into_protocol_message()
             .map_err(|_| ChatError::Malformed("not a protocol message"))?;
 
-        let group_id = message.group_id().as_slice().to_vec();
+        let room_id = message.group_id().as_slice().to_vec();
         let theirs = message.epoch().as_u64();
-        let mut group = self.load(&group_id)?;
+        let mut group = self.load(&room_id)?;
         let ours = group.epoch().as_u64();
 
         let processed = match group.process_message(&self.provider, message) {
@@ -394,7 +394,7 @@ impl Session {
             // readable whether or not the body can be opened.
             Err(e) => {
                 return Ok(Received::Undecryptable {
-                    group_id,
+                    room_id,
                     theirs,
                     ours,
                     replayed: is_replay(&e),
@@ -404,7 +404,7 @@ impl Session {
 
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(m) => Ok(Received::Application {
-                group_id,
+                room_id,
                 plaintext: m.into_bytes(),
             }),
             ProcessedMessageContent::StagedCommitMessage(commit) => {
@@ -413,11 +413,11 @@ impl Session {
                 group
                     .merge_staged_commit(&self.provider, *commit)
                     .map_err(mls)?;
-                Ok(Received::GroupChanged { group_id })
+                Ok(Received::RoomChanged { room_id })
             }
             ProcessedMessageContent::ProposalMessage(_)
             | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-                Ok(Received::ProposalQueued { group_id })
+                Ok(Received::ProposalQueued { room_id })
             }
         }
     }
@@ -429,8 +429,8 @@ impl Session {
     /// they cannot read what follows, as a matter of arithmetic rather than of
     /// the application declining to show it to them. ADR 0013 wires credential
     /// revocation to this.
-    pub fn remove_member(&mut self, group_id: &[u8], identity: &[u8]) -> Result<Vec<u8>> {
-        let mut group = self.load(group_id)?;
+    pub fn remove_member(&mut self, room_id: &[u8], identity: &[u8]) -> Result<Vec<u8>> {
+        let mut group = self.load(room_id)?;
         let leaf = group
             .members()
             .find(|m| m.credential.serialized_content() == identity)
@@ -476,16 +476,16 @@ impl Session {
     }
 
     /// Members' identities, in leaf order.
-    pub fn members(&self, group_id: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let group = self.load(group_id)?;
+    pub fn members(&self, room_id: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let group = self.load(room_id)?;
         Ok(group
             .members()
             .map(|m| m.credential.serialized_content().to_vec())
             .collect())
     }
 
-    fn load(&self, group_id: &[u8]) -> Result<MlsGroup> {
-        MlsGroup::load(self.provider.storage(), &GroupId::from_slice(group_id))
+    fn load(&self, room_id: &[u8]) -> Result<MlsGroup> {
+        MlsGroup::load(self.provider.storage(), &GroupId::from_slice(room_id))
             .map_err(mls)?
             .ok_or(ChatError::NoSuchGroup)
     }
@@ -502,7 +502,7 @@ mod tests {
         let mut alice = Session::new(b"did:peer:alice").unwrap();
         let mut bob = Session::new(b"did:peer:bob").unwrap();
 
-        let group = alice.create_group().unwrap();
+        let group = alice.create_room().unwrap();
         let invitation = alice
             .add_member(&group, &bob.key_package().unwrap())
             .unwrap();
@@ -526,11 +526,11 @@ mod tests {
         let mut bob = Session::new(b"did:peer:bob").unwrap();
         let key_package = bob.key_package().unwrap();
 
-        let first = alice.create_group().unwrap();
+        let first = alice.create_room().unwrap();
         let to_first = alice.add_member(&first, &key_package).unwrap();
         bob.join(&to_first.welcome).unwrap();
 
-        let second = alice.create_group().unwrap();
+        let second = alice.create_room().unwrap();
         let to_second = alice.add_member(&second, &key_package).unwrap();
 
         assert!(
@@ -587,10 +587,10 @@ mod tests {
         match bob.receive(&wire).unwrap() {
             Received::Application {
                 plaintext,
-                group_id,
+                room_id,
             } => {
                 assert_eq!(plaintext, b"prachum 6 mong");
-                assert_eq!(group_id, group);
+                assert_eq!(room_id, group);
             }
             other => panic!("expected an application message, got {other:?}"),
         }
@@ -657,7 +657,7 @@ mod tests {
     fn a_tampered_key_package_is_refused() {
         let mut alice = Session::new(b"did:peer:alice").unwrap();
         let mut bob = Session::new(b"did:peer:bob").unwrap();
-        let group = alice.create_group().unwrap();
+        let group = alice.create_room().unwrap();
 
         // Corrupt the last byte, which lands in the signature. Validation must
         // reject it: accepting an unverified key package would let anyone add
