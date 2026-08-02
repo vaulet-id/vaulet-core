@@ -243,6 +243,12 @@ pub fn lock_phrase(storage_dir: &str) -> Result<()> {
 
 /// The 32-byte BIP39 entropy behind a seed-first mnemonic — the secret Shamir
 /// splits, so recovery rebuilds the mnemonic (not just the derived scalar).
+/// The same, for the Simple Recovery module (ADR 0019), which splits the very
+/// same 32 bytes rather than a second secret derived from them.
+pub(crate) fn mnemonic_entropy_public(secret: &str) -> Result<[u8; 32]> {
+    mnemonic_entropy(secret)
+}
+
 fn mnemonic_entropy(secret: &str) -> Result<[u8; 32]> {
     use bip39::Mnemonic;
     let m = Mnemonic::parse(secret.trim())

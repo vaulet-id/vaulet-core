@@ -19,6 +19,8 @@ use zeroize::Zeroize;
 
 use crate::{CoreError, Result};
 
+pub mod simple;
+
 // Argon2id parameters — kept in the envelope so a future decrypt can reproduce
 // the derivation even if these defaults change.
 // Hardened for an offline-attackable backup file protecting a root seed: well
@@ -60,6 +62,53 @@ fn derive_key(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[
         .hash_password_into(passphrase.as_bytes(), salt, &mut key)
         .map_err(|e| CoreError::Key(format!("argon2 derive: {e}")))?;
     Ok(key)
+}
+
+/// The same derivation, for the Simple Recovery module (ADR 0019). It masks a
+/// share rather than sealing one, so it needs the key and not the envelope.
+pub(crate) fn derive_key_public(
+    passphrase: &str,
+    salt: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+) -> Result<[u8; KEY_LEN]> {
+    derive_key(passphrase, salt, m, t, p)
+}
+
+/// Seal bytes under a key that was derived elsewhere — the wallet contents in a
+/// Simple Recovery file, whose key comes from the seed rather than a passphrase.
+pub(crate) fn seal_with_key(key: &[u8; KEY_LEN], plaintext: &str) -> Result<String> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand_core::OsRng.fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
+    let ct = cipher
+        .encrypt(XNonce::from_slice(&nonce), plaintext.as_bytes())
+        .map_err(|e| CoreError::Key(format!("encrypt: {e}")))?;
+    Ok(format!(
+        "{}.{}",
+        STANDARD.encode(nonce),
+        STANDARD.encode(ct)
+    ))
+}
+
+/// Open what [`seal_with_key`] produced.
+pub(crate) fn open_with_key(key: &[u8; KEY_LEN], sealed: &str) -> Result<String> {
+    let (nonce_b64, ct_b64) = sealed
+        .trim()
+        .split_once('.')
+        .ok_or_else(|| CoreError::Key("malformed sealed contents".into()))?;
+    let nonce = STANDARD
+        .decode(nonce_b64)
+        .map_err(|_| CoreError::Key("malformed sealed contents".into()))?;
+    let ct = STANDARD
+        .decode(ct_b64)
+        .map_err(|_| CoreError::Key("malformed sealed contents".into()))?;
+    let cipher = XChaCha20Poly1305::new(key.as_ref().into());
+    let plain = cipher
+        .decrypt(XNonce::from_slice(&nonce), ct.as_slice())
+        .map_err(|_| CoreError::Key("could not open the backup contents".into()))?;
+    String::from_utf8(plain).map_err(|_| CoreError::Key("backup contents are not text".into()))
 }
 
 /// Encrypt a secret into an envelope with the given Argon2id memory/iterations.

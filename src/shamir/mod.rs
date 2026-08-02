@@ -72,7 +72,14 @@ pub fn reconstruct(shares: &[String]) -> Result<Vec<u8>> {
     let secret = Sharks(threshold)
         .recover(raw.as_slice())
         .map_err(|e| CoreError::Key(format!("recover: {e}")))?;
-    if secret_checksum(&secret) != checksum.unwrap().as_slice() {
+    // An empty checksum means the envelope deliberately does not carry one:
+    // Simple Recovery strips it from the share Vaulet stores, because four bytes
+    // of SHA-256 over the seed sitting beside a passphrase-derived blob is an
+    // offline oracle for guessing that passphrase (ADR 0019). Reconstruction is
+    // then unverified here and verified where it can be — the recovered seed
+    // derives a DID, which either matches the wallet or the recovery failed.
+    let checksum = checksum.unwrap();
+    if !checksum.is_empty() && secret_checksum(&secret) != checksum.as_slice() {
         return Err(CoreError::Key("shares did not reconstruct a valid key".into()));
     }
     Ok(secret)
