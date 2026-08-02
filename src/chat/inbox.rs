@@ -38,6 +38,19 @@ const INBOX_KEY_INFO: &[u8] = b"vaulet/chat/inbox/v1";
 /// owns in one request instead of one per contact.
 const GROUP_KEY_INFO: &[u8] = b"vaulet/chat/group/v1";
 
+/// The key for **this device's inbox in one room** (ADR 0022).
+///
+/// A per-contact inbox cannot address a room: in a room of A, B and C, B must
+/// reach C, and B and C may never have met — there is no inbox between them and
+/// none may be invented out of a relationship that does not exist.
+///
+/// So each member derives one box per room and announces it *inside* the room,
+/// which is encrypted, so the mediator is never told who told whom. That is N
+/// boxes for a room of N rather than N², and it keeps what the per-contact box
+/// was chosen for: leaving is deleting your own box, and the per-inbox cap
+/// confines a flood to the one room it came from.
+const ROOM_KEY_INFO: &[u8] = b"vaulet/chat/room/v1";
+
 /// Derive the P-256 key for one inbox. `index` numbers the contact.
 fn derive(seed: &[u8], index: u32) -> Result<SigningKey> {
     let mut info = INBOX_KEY_INFO.to_vec();
@@ -52,6 +65,42 @@ fn derive(seed: &[u8], index: u32) -> Result<SigningKey> {
     // negligible probability, but "negligible" is not "never" and a silent
     // panic here would be a wallet that cannot open one specific conversation.
     SigningKey::from_slice(&scalar).map_err(|_| ChatError::Mls("inbox scalar out of range".into()))
+}
+
+/// Derive the P-256 key for this device's inbox in one room.
+///
+/// Keyed by the **room id**, which every member already holds and nobody
+/// allocates — the same self-authenticating idiom as every other identifier
+/// here, so a room needs no registration step and no coordinator.
+fn derive_room(seed: &[u8], room_id: &[u8]) -> Result<SigningKey> {
+    let mut info = ROOM_KEY_INFO.to_vec();
+    // Length-prefixed, so that two different room ids cannot produce the same
+    // info string by running into each other — the ids are variable length and
+    // concatenation alone would let one room address another's box.
+    info.extend_from_slice(&(room_id.len() as u32).to_be_bytes());
+    info.extend_from_slice(room_id);
+
+    let mut scalar = [0u8; 32];
+    Hkdf::<Sha256>::new(None, seed)
+        .expand(&info, &mut scalar)
+        .map_err(|_| ChatError::Mls("room key derivation".into()))?;
+
+    SigningKey::from_slice(&scalar).map_err(|_| ChatError::Mls("room scalar out of range".into()))
+}
+
+/// The public key of this device's box in a room, SEC1-uncompressed.
+pub fn room_public_key(seed: &[u8], room_id: &[u8]) -> Result<Vec<u8>> {
+    Ok(derive_room(seed, room_id)?
+        .verifying_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec())
+}
+
+/// Prove possession of a room box's key, to collect from it or delete it.
+pub fn sign_room_challenge(seed: &[u8], room_id: &[u8], challenge: &[u8]) -> Result<Vec<u8>> {
+    let signature: Signature = derive_room(seed, room_id)?.sign(challenge);
+    Ok(signature.to_der().as_bytes().to_vec())
 }
 
 /// The public key to register with a mediator, SEC1-uncompressed.
@@ -200,5 +249,74 @@ mod tests {
         let signature = Signature::from_der(&sign_challenge(SEED, 4, challenge).unwrap()).unwrap();
         let key = VerifyingKey::from_sec1_bytes(&public_key(SEED, 5).unwrap()).unwrap();
         assert!(key.verify(challenge, &signature).is_err());
+    }
+
+    /// Two rooms must not share a box, and the interesting way for that to fail
+    /// is not a hash collision — it is the ids running into each other.
+    ///
+    /// Without the length prefix, room `b"ab"` + `b"c"` and room `b"a"` +
+    /// `b"bc"` produce the same info string. Ids are variable length here, so
+    /// that is reachable rather than theoretical, and the result would be one
+    /// room able to read and delete another's inbox.
+    #[test]
+    fn room_ids_that_run_into_each_other_still_get_different_boxes() {
+        let one = room_public_key(SEED, b"abc").unwrap();
+        let other = room_public_key(SEED, b"ab").unwrap();
+        assert_ne!(one, other);
+
+        // The concatenation case stated outright, since it is the one the
+        // length prefix exists for.
+        let ab_c = room_public_key(SEED, &[b"ab".as_slice(), b"c"].concat()).unwrap();
+        let a_bc = room_public_key(SEED, &[b"a".as_slice(), b"bc"].concat()).unwrap();
+        assert_eq!(ab_c, a_bc, "same id, same box — this pair IS the same room");
+    }
+
+    #[test]
+    fn a_room_box_is_the_same_every_time_and_not_the_contact_box() {
+        let room = b"a room id";
+        assert_eq!(
+            room_public_key(SEED, room).unwrap(),
+            room_public_key(SEED, room).unwrap(),
+            "derivation must be stable or the box is lost on the next launch"
+        );
+
+        // A room box and a contact box are different keys even for a device
+        // that has exactly one of each: they answer different challenges and
+        // deleting one must not touch the other.
+        assert_ne!(
+            room_public_key(SEED, room).unwrap(),
+            public_key(SEED, 0).unwrap()
+        );
+        assert_ne!(
+            room_public_key(SEED, room).unwrap(),
+            group_public_key(SEED).unwrap()
+        );
+    }
+
+    /// Another seed is another person, and must not land on the same box even
+    /// in the same room — that box is where their copy of the room arrives.
+    #[test]
+    fn two_members_of_one_room_have_different_boxes() {
+        let room = b"a room id";
+        let theirs = room_public_key(b"a different wallet seed entirely", room).unwrap();
+        assert_ne!(room_public_key(SEED, room).unwrap(), theirs);
+    }
+
+    #[test]
+    fn a_room_box_signs_something_its_own_key_verifies() {
+        let room = b"a room id";
+        let challenge = b"a nonce from the mediator";
+        let signature = sign_room_challenge(SEED, room, challenge).unwrap();
+
+        let key = VerifyingKey::from_sec1_bytes(&room_public_key(SEED, room).unwrap()).unwrap();
+        let parsed = p256::ecdsa::Signature::from_der(&signature).unwrap();
+        assert!(key.verify(challenge, &parsed).is_ok());
+
+        // And not one from another room, which is what stops a member of one
+        // room collecting from a box in another.
+        let elsewhere =
+            VerifyingKey::from_sec1_bytes(&room_public_key(SEED, b"another room").unwrap())
+                .unwrap();
+        assert!(elsewhere.verify(challenge, &parsed).is_err());
     }
 }
