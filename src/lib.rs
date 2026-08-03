@@ -112,8 +112,7 @@ pub fn wallet_reset(storage_dir: &str) -> Result<()> {
     for name in ["phrase_locked", "wallet_key.jwk", "wallet_mnemonic.txt"] {
         let p = std::path::Path::new(storage_dir).join(name);
         if p.exists() {
-            std::fs::remove_file(&p)
-                .map_err(|e| CoreError::Key(format!("delete {name}: {e}")))?;
+            std::fs::remove_file(&p).map_err(|e| CoreError::Key(format!("delete {name}: {e}")))?;
         }
     }
     Ok(())
@@ -204,7 +203,6 @@ pub fn wallet_import_vault(envelope: &str, passphrase: &str) -> Result<Vault> {
     Ok(vault)
 }
 
-
 /// Validate a 24-word recovery phrase and return it as the wallet secret
 /// (seed-first, ADR 0008). A bad word, wrong length, or failed checksum errors.
 pub fn wallet_import_phrase(phrase: &str) -> Result<String> {
@@ -228,7 +226,9 @@ pub fn wallet_reveal_phrase(secret: &str) -> Result<String> {
 /// policy marker (the secret lives in the Keychain, untouched). This is the
 /// policy seam: hardware-key and org-policy gates grow here (see [`lock_phrase`]).
 pub fn is_phrase_locked(storage_dir: &str) -> bool {
-    std::path::Path::new(storage_dir).join("phrase_locked").exists()
+    std::path::Path::new(storage_dir)
+        .join("phrase_locked")
+        .exists()
 }
 
 /// Permanently disable revealing the recovery phrase on this device, once the
@@ -255,7 +255,9 @@ fn mnemonic_entropy(secret: &str) -> Result<[u8; 32]> {
         .map_err(|_| CoreError::Key("advanced backup needs a seed-first wallet".into()))?;
     let (entropy, len) = m.to_entropy_array();
     if len != 32 {
-        return Err(CoreError::Key("advanced backup needs a 24-word seed".into()));
+        return Err(CoreError::Key(
+            "advanced backup needs a 24-word seed".into(),
+        ));
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(&entropy[..32]);
@@ -300,8 +302,7 @@ pub fn wallet_build_proof_jwt(
 ) -> Result<String> {
     let key = load_secret_key(secret)?;
     let holder_jwk = key.public_jwk()?;
-    let proof =
-        protocol::oid4vci::holder_proof_bound(issuer, c_nonce, iat, cb, holder_jwk, &key)?;
+    let proof = protocol::oid4vci::holder_proof_bound(issuer, c_nonce, iat, cb, holder_jwk, &key)?;
     Ok(proof.jwt)
 }
 
@@ -343,6 +344,42 @@ pub fn wallet_build_signin_jwt(
     build_proof_jwt(&header, &claims, &key)
 }
 
+/// `typ` of the JWT that starts connecting an outside account (ADR 0024).
+///
+/// Its own `typ` for the same reason the sign-in has one: a signature says what
+/// it was for in one field, and a Studio sign-in must not be spendable as
+/// permission to attach somebody's Google account to a wallet.
+pub const SOCIAL_CONNECT_JWT_TYP: &str = "vaulet-connect-account+jwt";
+
+/// Sign the challenge that begins a Google or Facebook connection.
+///
+/// The provider redirects to the issuer, not to the phone, so the issuer has to
+/// know which wallet asked before it sends anybody anywhere. This signature is
+/// that answer, and the credential at the end is issued to this key alone.
+pub fn wallet_build_connect_jwt(
+    secret: &str,
+    audience: &str,
+    nonce: &str,
+    iat: i64,
+) -> Result<String> {
+    use protocol::oid4vci::{build_proof_jwt, ProofJwtClaims, ProofJwtHeader};
+    let key = load_secret_key(secret)?;
+    let header = ProofJwtHeader {
+        typ: SOCIAL_CONNECT_JWT_TYP.to_string(),
+        alg: "ES256".to_string(),
+        jwk: Some(key.public_jwk()?),
+        kid: None,
+    };
+    let claims = ProofJwtClaims {
+        iss: None,
+        aud: audience.to_string(),
+        iat,
+        nonce: nonce.to_string(),
+        cb: None,
+    };
+    build_proof_jwt(&header, &claims, &key)
+}
+
 /// Sign the fields a holder typed into a form (ADR 0014).
 ///
 /// `claims` is the JSON object of answers, keyed by the form's JSON Schema
@@ -357,17 +394,9 @@ pub fn wallet_sign_form_claims(
     claims_json: &str,
 ) -> Result<String> {
     let key = load_secret_key(secret)?;
-    let claims: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(claims_json)
-            .map_err(|e| CoreError::Protocol(format!("form claims json: {e}")))?;
-    protocol::oid4vp::sign_form_claims(
-        audience,
-        nonce,
-        iat,
-        claims,
-        key.public_jwk()?,
-        &key,
-    )
+    let claims: serde_json::Map<String, serde_json::Value> = serde_json::from_str(claims_json)
+        .map_err(|e| CoreError::Protocol(format!("form claims json: {e}")))?;
+    protocol::oid4vp::sign_form_claims(audience, nonce, iat, claims, key.public_jwk()?, &key)
 }
 
 /// Verify an ePassport read (ADR 0009): data-group integrity against EF.SOD, plus
