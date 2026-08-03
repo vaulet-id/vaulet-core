@@ -51,6 +51,9 @@ const GROUP_KEY_INFO: &[u8] = b"vaulet/chat/group/v1";
 /// confines a flood to the one room it came from.
 const ROOM_KEY_INFO: &[u8] = b"vaulet/chat/room/v1";
 
+/// The label for a room box's *sealing* key, distinct from its signing one.
+const ROOM_ENVELOPE_INFO: &[u8] = b"vaulet/chat/room-envelope/v1";
+
 /// Derive the P-256 key for one inbox. `index` numbers the contact.
 fn derive(seed: &[u8], index: u32) -> Result<SigningKey> {
     let mut info = INBOX_KEY_INFO.to_vec();
@@ -95,6 +98,25 @@ pub fn room_public_key(seed: &[u8], room_id: &[u8]) -> Result<Vec<u8>> {
         .to_encoded_point(false)
         .as_bytes()
         .to_vec())
+}
+
+/// The HPKE keypair for this device's box in one room — public, private.
+///
+/// **A different key from the one that signs**, deriving from a different
+/// label, for the same reason the per-contact envelope key is: one key used
+/// both to sign challenges and to agree secrets is key reuse across two
+/// algorithms, and the fact that both belong to the same person does not make
+/// it sound.
+pub fn room_envelope_keypair(seed: &[u8], room_id: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut info = ROOM_ENVELOPE_INFO.to_vec();
+    info.extend_from_slice(&(room_id.len() as u32).to_be_bytes());
+    info.extend_from_slice(room_id);
+
+    let mut ikm = [0u8; 32];
+    Hkdf::<Sha256>::new(None, seed)
+        .expand(&info, &mut ikm)
+        .map_err(|_| ChatError::Mls("room envelope key derivation".into()))?;
+    super::envelope::keypair_from_ikm(&ikm)
 }
 
 /// Prove possession of a room box's key, to collect from it or delete it.
@@ -318,5 +340,27 @@ mod tests {
             VerifyingKey::from_sec1_bytes(&room_public_key(SEED, b"another room").unwrap())
                 .unwrap();
         assert!(elsewhere.verify(challenge, &parsed).is_err());
+    }
+
+    /// The two room keys must not be the same key, which is the whole reason
+    /// there are two labels — signing challenges and agreeing secrets with one
+    /// key is reuse across algorithms, and one owner does not make it sound.
+    #[test]
+    fn a_rooms_sealing_key_is_not_its_signing_key() {
+        let room = b"a room id";
+        let (sealing, _) = room_envelope_keypair(SEED, room).unwrap();
+        assert_ne!(sealing, room_public_key(SEED, room).unwrap());
+    }
+
+    #[test]
+    fn a_rooms_sealing_key_is_stable_and_its_own() {
+        let room = b"a room id";
+        let (mine, private) = room_envelope_keypair(SEED, room).unwrap();
+        assert_eq!(mine, room_envelope_keypair(SEED, room).unwrap().0);
+        assert_eq!(private, room_envelope_keypair(SEED, room).unwrap().1);
+
+        // Another room, and another member, each get their own.
+        assert_ne!(mine, room_envelope_keypair(SEED, b"another room").unwrap().0);
+        assert_ne!(mine, room_envelope_keypair(b"another seed entirely", room).unwrap().0);
     }
 }
