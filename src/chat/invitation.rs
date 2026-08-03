@@ -65,6 +65,20 @@ const POINT_LEN: usize = 33;
 /// A card for any other mediator still spells it out — the flag compresses the
 /// common case without making the uncommon one unrepresentable.
 const FLAG_DEFAULT_MEDIATOR: u8 = 1 << 0;
+
+/// The one mediator a card may refer to without naming it.
+///
+/// **A constant, and not a parameter, because it is a compression dictionary
+/// rather than a policy.** It used to be passed in as "the default", which the
+/// encoder read as *the sender's* and the decoder as *the reader's* — two
+/// different values for anybody running their own mediator. Two people with
+/// different defaults then disagreed about where a third was reachable, and
+/// deposits are answered identically whether or not anybody is there, so
+/// messages went to an inbox on the wrong machine with nobody told anything.
+///
+/// Anyone on any other mediator emits a card that names it in full, which costs
+/// a longer QR and is the only thing that can be right.
+pub const WELL_KNOWN_MEDIATOR: &str = "https://vaulet-mediator.fly.dev";
 /// `flags` bit 1: a key package follows. Absent in a QR code, present in the
 /// sealed introduction.
 const FLAG_HAS_KEY_PACKAGE: u8 = 1 << 1;
@@ -201,12 +215,13 @@ fn take<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
 
 /// Encode for display as a QR code or a link.
 ///
-/// `default_mediator` is the URL this build ships with. When the card names
-/// that one, it is replaced by a single bit — which is most of what separates a
-/// code you have to hold still for from one that reads at a glance.
-pub fn encode(invitation: &Invitation, default_mediator: &str) -> Result<String> {
+/// A card for [`WELL_KNOWN_MEDIATOR`] carries one bit instead of a URL, which
+/// is most of what separates a code you have to hold still for from one that
+/// reads at a glance. Every other mediator is named in full — see the constant
+/// for why that is not negotiable.
+pub fn encode(invitation: &Invitation) -> Result<String> {
     let mut flags = 0u8;
-    if invitation.mediator == default_mediator {
+    if invitation.mediator == WELL_KNOWN_MEDIATOR {
         flags |= FLAG_DEFAULT_MEDIATOR;
     }
     if invitation.has_key_package {
@@ -265,7 +280,7 @@ pub fn share_link(code: &str) -> String {
 /// This is the one place in the chat code that meets input chosen by a
 /// stranger, so every length is checked and nothing is trusted to be
 /// well-formed.
-pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
+pub fn decode(text: &str) -> Result<Invitation> {
     let encoded = unwrap_link(text)
         .strip_prefix(SCHEME)
         .ok_or(ChatError::Malformed("not a vaulet invitation"))?;
@@ -284,7 +299,7 @@ pub fn decode(text: &str, default_mediator: &str) -> Result<Invitation> {
         .ok_or(ChatError::Malformed("invitation flags"))?;
 
     let mediator = if flags & FLAG_DEFAULT_MEDIATOR != 0 {
-        default_mediator.to_string()
+        WELL_KNOWN_MEDIATOR.to_string()
     } else {
         String::from_utf8(take(&mut rest)?.to_vec())
             .map_err(|_| ChatError::Malformed("invitation mediator"))?
@@ -378,11 +393,7 @@ mod tests {
     }
 
     fn round_trip(invitation: &Invitation) -> Invitation {
-        decode(
-            &encode(invitation, DEFAULT_MEDIATOR).unwrap(),
-            DEFAULT_MEDIATOR,
-        )
-        .unwrap()
+        decode(&encode(invitation).unwrap()).unwrap()
     }
 
     /// The whole point of the name being in the card: it arrives with no reply
@@ -434,14 +445,11 @@ mod tests {
     /// has to say so out loud.
     #[test]
     fn a_name_at_the_cap_keeps_the_card_scannable() {
-        let bare = encode(&card(), DEFAULT_MEDIATOR).unwrap();
-        let named = encode(
-            &Invitation {
-                display_name: "ก".repeat(MAX_NAME_CHARS),
-                ..card()
-            },
-            DEFAULT_MEDIATOR,
-        )
+        let bare = encode(&card()).unwrap();
+        let named = encode(&Invitation {
+            display_name: "ก".repeat(MAX_NAME_CHARS),
+            ..card()
+        })
         .unwrap();
 
         assert!(bare.len() < 110, "the bare card stays tiny: {}", bare.len());
@@ -456,14 +464,11 @@ mod tests {
     #[test]
     fn a_nameless_card_is_no_bigger_than_before() {
         assert_eq!(
-            encode(&card(), DEFAULT_MEDIATOR).unwrap(),
-            encode(
-                &Invitation {
-                    display_name: String::new(),
-                    ..card()
-                },
-                DEFAULT_MEDIATOR
-            )
+            encode(&card()).unwrap(),
+            encode(&Invitation {
+                display_name: String::new(),
+                ..card()
+            })
             .unwrap()
         );
     }
@@ -486,45 +491,43 @@ mod tests {
         elsewhere.mediator = "https://someone-elses-mediator.example".into();
 
         assert_eq!(round_trip(&elsewhere), elsewhere);
-        assert!(
-            encode(&card(), DEFAULT_MEDIATOR).unwrap().len()
-                < encode(&elsewhere, DEFAULT_MEDIATOR).unwrap().len()
-        );
+        assert!(encode(&card()).unwrap().len() < encode(&elsewhere).unwrap().len());
     }
 
     /// A card read by a build pointing somewhere else must not silently inherit
     /// that build's mediator for a sender who never chose it.
     #[test]
-    fn a_default_flagged_card_resolves_to_the_readers_default() {
-        let text = encode(&card(), DEFAULT_MEDIATOR).unwrap();
-        let elsewhere = decode(&text, "https://another.example").unwrap();
-        assert_eq!(elsewhere.mediator, "https://another.example");
+    fn a_default_flagged_card_resolves_to_the_well_known_one() {
+        // **This test used to assert the opposite**, and that is why the bug
+        // lived: it said a flagged card resolves to *the reader's* default,
+        // which is a different machine for anybody running their own. The
+        // sender is describing where they are, not asking the reader where they
+        // themselves are.
+        let text = encode(&card()).unwrap();
+        assert_eq!(decode(&text).unwrap().mediator, WELL_KNOWN_MEDIATOR);
     }
 
     #[test]
     fn a_card_is_much_shorter_than_an_introduction() {
-        assert!(
-            encode(&card(), DEFAULT_MEDIATOR).unwrap().len()
-                < encode(&introduction(), DEFAULT_MEDIATOR).unwrap().len()
-        );
+        assert!(encode(&card()).unwrap().len() < encode(&introduction()).unwrap().len());
     }
 
     /// The two ways a code travels must mean the same thing.
     #[test]
     fn a_card_wrapped_in_a_link_decodes_the_same() {
-        let bare = encode(&card(), DEFAULT_MEDIATOR).unwrap();
+        let bare = encode(&card()).unwrap();
         let link = share_link(&bare);
 
         assert!(link.starts_with("https://app.vaulet.id/"));
         assert!(link.contains('#'), "the payload must sit in the fragment");
-        assert_eq!(decode(&link, DEFAULT_MEDIATOR).unwrap(), card());
+        assert_eq!(decode(&link).unwrap(), card());
     }
 
     /// The fragment is not decoration: browsers never send it, so a link tapped
     /// by somebody without the app tells our server nothing about the card.
     #[test]
     fn the_link_keeps_the_payload_out_of_the_path() {
-        let link = share_link(&encode(&card(), DEFAULT_MEDIATOR).unwrap());
+        let link = share_link(&encode(&card()).unwrap());
         let (before, _) = link.split_once('#').unwrap();
         assert!(!before.contains("vlt:i:"));
     }
@@ -533,25 +536,22 @@ mod tests {
     fn surrounding_whitespace_is_forgiven() {
         // Pasted text picks up newlines; refusing it would be a papercut with
         // no security value, since the payload is checked either way.
-        let text = format!("  {}\n", encode(&card(), DEFAULT_MEDIATOR).unwrap());
-        assert_eq!(decode(&text, DEFAULT_MEDIATOR).unwrap(), card());
+        let text = format!("  {}\n", encode(&card()).unwrap());
+        assert_eq!(decode(&text).unwrap(), card());
     }
 
     #[test]
     fn a_credential_offer_is_not_mistaken_for_an_invitation() {
         assert!(matches!(
-            decode(
-                "openid-credential-offer://?credential_offer=%7B%7D",
-                DEFAULT_MEDIATOR
-            ),
+            decode("openid-credential-offer://?credential_offer=%7B%7D"),
             Err(ChatError::Malformed(_))
         ));
     }
 
     #[test]
     fn a_truncated_invitation_is_refused_rather_than_half_read() {
-        let full = encode(&card(), DEFAULT_MEDIATOR).unwrap();
-        assert!(decode(&full[..full.len() - 8], DEFAULT_MEDIATOR).is_err());
+        let full = encode(&card()).unwrap();
+        assert!(decode(&full[..full.len() - 8]).is_err());
     }
 
     #[test]
@@ -562,10 +562,7 @@ mod tests {
         body.extend_from_slice(b"extra");
 
         let text = format!("{SCHEME}{}", B64.encode(body));
-        assert!(matches!(
-            decode(&text, DEFAULT_MEDIATOR),
-            Err(ChatError::Malformed(_))
-        ));
+        assert!(matches!(decode(&text), Err(ChatError::Malformed(_))));
     }
 
     /// A length field claiming more than the buffer holds must not panic.
@@ -578,10 +575,7 @@ mod tests {
         body.extend_from_slice(b"short");
 
         let text = format!("{SCHEME}{}", B64.encode(body));
-        assert!(matches!(
-            decode(&text, DEFAULT_MEDIATOR),
-            Err(ChatError::Malformed(_))
-        ));
+        assert!(matches!(decode(&text), Err(ChatError::Malformed(_))));
     }
 
     #[test]
@@ -590,11 +584,8 @@ mod tests {
         // sender did not choose.
         let mut invitation = card();
         invitation.mediator = "mediator.example".into();
-        let text = encode(&invitation, DEFAULT_MEDIATOR).unwrap();
-        assert!(matches!(
-            decode(&text, DEFAULT_MEDIATOR),
-            Err(ChatError::Malformed(_))
-        ));
+        let text = encode(&invitation).unwrap();
+        assert!(matches!(decode(&text), Err(ChatError::Malformed(_))));
     }
 
     /// The ticket travels with the key package, to somebody who answered — not
@@ -605,19 +596,16 @@ mod tests {
         let mut introduction = introduction();
         introduction.push_ticket = ticket.clone();
 
-        let text = encode(&introduction, DEFAULT_MEDIATOR).unwrap();
-        assert_eq!(decode(&text, DEFAULT_MEDIATOR).unwrap().push_ticket, ticket);
+        let text = encode(&introduction).unwrap();
+        assert_eq!(decode(&text).unwrap().push_ticket, ticket);
     }
 
     /// Somebody who declined notifications has no ticket, and that must be an
     /// ordinary card rather than a special case anybody has to handle.
     #[test]
     fn no_ticket_is_a_card_like_any_other() {
-        let text = encode(&introduction(), DEFAULT_MEDIATOR).unwrap();
-        assert!(decode(&text, DEFAULT_MEDIATOR)
-            .unwrap()
-            .push_ticket
-            .is_empty());
+        let text = encode(&introduction()).unwrap();
+        assert!(decode(&text).unwrap().push_ticket.is_empty());
     }
 
     /// The QR is the one place in this system where size is a feature — 97
@@ -625,7 +613,7 @@ mod tests {
     /// something the scanner cannot use until they have answered anyway.
     #[test]
     fn a_card_stays_short_whatever_the_introduction_carries() {
-        let card = encode(&card(), DEFAULT_MEDIATOR).unwrap();
+        let card = encode(&card()).unwrap();
         assert!(
             card.len() < 120,
             "the card grew to {} characters",
@@ -636,19 +624,53 @@ mod tests {
     #[test]
     fn a_future_invitation_version_is_refused_by_name() {
         let mut body = B64
-            .decode(
-                encode(&card(), DEFAULT_MEDIATOR)
-                    .unwrap()
-                    .strip_prefix(SCHEME)
-                    .unwrap(),
-            )
+            .decode(encode(&card()).unwrap().strip_prefix(SCHEME).unwrap())
             .unwrap();
         body[0] = 7;
 
         let text = format!("{SCHEME}{}", B64.encode(body));
         assert!(matches!(
-            decode(&text, DEFAULT_MEDIATOR),
+            decode(&text),
             Err(ChatError::UnsupportedInvitationVersion(7))
         ));
+    }
+
+    /// **A card must name the same mediator to everybody who reads it.**
+    ///
+    /// The size optimisation replaces the mediator with one bit when it is the
+    /// default — and "the default" used to mean *the reader's own*, which is a
+    /// different value for anybody running their own mediator. Two people with
+    /// different defaults therefore disagreed about where a third was
+    /// reachable, and the failure is total and silent: deposits are answered
+    /// identically whether or not anybody is there, so messages went to an
+    /// inbox on the wrong machine and neither party was told anything.
+    ///
+    /// Latent while every build shipped one hardcoded mediator, and certain to
+    /// fire the moment "anyone can run one" (ADR 0013) becomes true in the UI.
+    /// Found by running two mediators and putting a room across them.
+    #[test]
+    fn a_card_names_the_same_mediator_however_the_reader_is_configured() {
+        let invitation = Invitation {
+            mediator: "https://mediator.example".into(),
+            ..card()
+        };
+
+        let text = encode(&invitation).unwrap();
+        assert_eq!(
+            decode(&text).unwrap().mediator,
+            "https://mediator.example",
+            "a named mediator must survive being read by anybody"
+        );
+
+        // And the compressed case: a card for the well-known one reads as the
+        // well-known one, not as whatever the reader happens to use.
+        let default = Invitation {
+            mediator: WELL_KNOWN_MEDIATOR.into(),
+            ..card()
+        };
+        assert_eq!(
+            decode(&encode(&default).unwrap()).unwrap().mediator,
+            WELL_KNOWN_MEDIATOR
+        );
     }
 }
