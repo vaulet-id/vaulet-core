@@ -17,6 +17,7 @@ use sd_jwt_payload::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::io::Read as _;
 
 use crate::did::{signing_jwk_for_kid, DidResolver};
 use crate::keys::software::SoftwareKey;
@@ -320,6 +321,98 @@ pub fn verify_via_resolver<R: DidResolver>(
     verify_with_did_document(sd_jwt, &doc, now)
 }
 
+/// Where a credential says its revocation status lives, and which bit in it —
+/// or None when it carries no status at all.
+///
+/// Pure, because the fetch belongs to whoever has a network (ADR 0004). The
+/// caller reads this, fetches that URL, and hands the result to
+/// [`status_is_revoked`].
+pub fn status_reference(sd_jwt: &str) -> Result<Option<(String, u64)>> {
+    let jwt_part = sd_jwt
+        .split('~')
+        .next()
+        .ok_or_else(|| CoreError::Credential("empty sd-jwt".into()))?;
+    let parts: Vec<&str> = jwt_part.split('.').collect();
+    if parts.len() != 3 {
+        return Err(CoreError::Credential("not a 3-part JWS".into()));
+    }
+    let payload: Value = serde_json::from_slice(
+        &B64.decode(parts[1])
+            .map_err(|e| CoreError::Credential(format!("payload b64: {e}")))?,
+    )
+    .map_err(|e| CoreError::Credential(format!("payload json: {e}")))?;
+    let Some(sl) = payload.get("status").and_then(|s| s.get("status_list")) else {
+        return Ok(None);
+    };
+    match (sl.get("uri").and_then(Value::as_str), sl.get("idx").and_then(Value::as_u64)) {
+        (Some(uri), Some(idx)) => Ok(Some((uri.to_string(), idx))),
+        // Half a reference is not a reference. Treating it as "no status" would
+        // quietly accept a credential whose issuer meant it to be revocable.
+        _ => Err(CoreError::Credential("malformed status reference".into())),
+    }
+}
+
+/// Whether `idx` is revoked according to a fetched Token Status List token.
+///
+/// `list_jwt` is the `statuslist+jwt` served at the credential's status uri and
+/// `issuer_jwk` is the key that signed the CREDENTIAL — the two must be the
+/// same issuer, or anyone could serve a list saying whatever they liked about
+/// somebody else's credentials.
+pub fn status_is_revoked(
+    list_jwt: &str,
+    issuer_jwk: &Value,
+    idx: u64,
+    expected_uri: &str,
+) -> Result<bool> {
+    let vk = verifying_key_from_jwk(issuer_jwk)?;
+    let payload = verify_compact_es256(list_jwt, &vk)?;
+
+    // The list must say it is the list we went looking for. Without this, a
+    // list legitimately signed by the issuer for one purpose could be served in
+    // place of another.
+    let sub = payload
+        .get("sub")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Credential("status list has no sub".into()))?;
+    if sub != expected_uri {
+        return Err(CoreError::Credential(
+            "status list is not the one the credential names".into(),
+        ));
+    }
+
+    let sl = payload
+        .get("status_list")
+        .ok_or_else(|| CoreError::Credential("not a status list".into()))?;
+    let bits = sl.get("bits").and_then(Value::as_u64).unwrap_or(1);
+    if bits != 1 {
+        // 2, 4 and 8 are legal and mean more states than valid/revoked. Reading
+        // one as if it were one bit would report the wrong state rather than no
+        // state, so it is refused until something needs it.
+        return Err(CoreError::Credential(
+            "only 1-bit status lists are understood".into(),
+        ));
+    }
+    let encoded = sl
+        .get("lst")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Credential("status list has no lst".into()))?;
+
+    let compressed = B64
+        .decode(encoded)
+        .map_err(|_| CoreError::Credential("status list is not base64url".into()))?;
+    let mut bytes = Vec::new();
+    flate2::read::ZlibDecoder::new(&compressed[..])
+        .read_to_end(&mut bytes)
+        .map_err(|_| CoreError::Credential("status list is not deflate-compressed".into()))?;
+
+    let byte = (idx / 8) as usize;
+    // Past the end is not "valid": the issuer meant this index to be in there.
+    let b = bytes
+        .get(byte)
+        .ok_or_else(|| CoreError::Credential("status index is past the end of the list".into()))?;
+    Ok(b >> (idx % 8) & 1 == 1)
+}
+
 /// Verify an issuer-signed SD-JWT against an already-resolved DID document.
 ///
 /// Selects the issuer key by the SD-JWT header `kid` (falling back to the first
@@ -518,6 +611,125 @@ fn verify_compact_es256(jws: &str, vk: &VerifyingKey) -> Result<Value> {
         .map_err(|e| CoreError::Credential(format!("bad payload b64: {e}")))?;
     serde_json::from_slice(&payload)
         .map_err(|e| CoreError::Credential(format!("payload not json: {e}")))
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use crate::keys::software::SoftwareKey;
+    use std::io::Write as _;
+
+    /// Build a status list token the way the issuer does.
+    fn list_token(key: &SoftwareKey, sub: &str, revoked: &[u64], bits: u64) -> String {
+        let mut bytes = vec![0u8; 512];
+        for idx in revoked {
+            bytes[(*idx / 8) as usize] |= 1 << (idx % 8);
+        }
+        let mut enc =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&bytes).unwrap();
+        let lst = B64.encode(enc.finish().unwrap());
+
+        let header = serde_json::json!({"alg": "ES256", "typ": "statuslist+jwt"});
+        let payload = serde_json::json!({
+            "iss": "did:web:example",
+            "sub": sub,
+            "iat": 1,
+            "status_list": { "bits": bits, "lst": lst },
+        });
+        let h = B64.encode(serde_json::to_vec(&header).unwrap());
+        let p = B64.encode(serde_json::to_vec(&payload).unwrap());
+        let signing = format!("{h}.{p}");
+        let sig = key.sign(signing.as_bytes()).unwrap();
+        format!("{signing}.{}", B64.encode(sig))
+    }
+
+    const URI: &str = "https://api.example/status/1";
+
+    #[test]
+    fn a_revoked_bit_reads_revoked_and_its_neighbours_do_not() {
+        let key = SoftwareKey::generate();
+        let jwk = key.public_jwk().unwrap();
+        let token = list_token(&key, URI, &[9], 1);
+
+        assert!(status_is_revoked(&token, &jwk, 9, URI).unwrap());
+        assert!(!status_is_revoked(&token, &jwk, 8, URI).unwrap());
+        assert!(!status_is_revoked(&token, &jwk, 10, URI).unwrap());
+    }
+
+    /// A list signed by somebody else says nothing about this issuer's
+    /// credentials — otherwise anyone could publish a list revoking everybody.
+    #[test]
+    fn a_list_signed_by_the_wrong_key_is_refused() {
+        let issuer = SoftwareKey::generate();
+        let stranger = SoftwareKey::generate();
+        let token = list_token(&stranger, URI, &[9], 1);
+        assert!(status_is_revoked(&token, &issuer.public_jwk().unwrap(), 9, URI).is_err());
+    }
+
+    /// And a list the issuer really did sign, served in place of the one the
+    /// credential names, is still the wrong list.
+    #[test]
+    fn a_list_for_a_different_uri_is_refused() {
+        let key = SoftwareKey::generate();
+        let token = list_token(&key, "https://api.example/status/2", &[9], 1);
+        assert!(status_is_revoked(&token, &key.public_jwk().unwrap(), 9, URI).is_err());
+    }
+
+    /// Past the end is not "valid": the issuer put this index in a list, so a
+    /// list too short to hold it is a list we cannot answer from.
+    #[test]
+    fn an_index_past_the_end_is_an_error_not_a_pass() {
+        let key = SoftwareKey::generate();
+        let token = list_token(&key, URI, &[], 1);
+        assert!(status_is_revoked(&token, &key.public_jwk().unwrap(), 99_999, URI).is_err());
+    }
+
+    /// Wider lists are legal and mean more states. Reading one as a single bit
+    /// would report the wrong state rather than no state.
+    #[test]
+    fn a_wider_list_is_refused_rather_than_misread() {
+        let key = SoftwareKey::generate();
+        let token = list_token(&key, URI, &[9], 2);
+        assert!(status_is_revoked(&token, &key.public_jwk().unwrap(), 9, URI).is_err());
+    }
+
+    /// Half a reference is not a reference — a credential its issuer meant to
+    /// be revocable must not be read as one that carries no status.
+    #[test]
+    fn a_malformed_status_reference_is_an_error_not_an_absence() {
+        let key = SoftwareKey::generate();
+        let params = IssueParams {
+            vct: "https://example/credential/x".into(),
+            iss: "did:web:example".into(),
+            iat: 1,
+            exp: 9_999_999_999,
+            holder_jwk: SoftwareKey::generate().public_jwk().unwrap(),
+            disclosable: Map::new(),
+            visible: serde_json::from_value(serde_json::json!({
+                "status": { "status_list": { "uri": URI } }
+            }))
+            .unwrap(),
+        };
+        let sd_jwt = issue(params, &key).unwrap();
+        assert!(status_reference(&sd_jwt).is_err());
+    }
+
+    #[test]
+    fn a_credential_with_no_status_has_no_reference() {
+        let key = SoftwareKey::generate();
+        let params = IssueParams {
+            vct: "https://example/credential/x".into(),
+            iss: "did:web:example".into(),
+            iat: 1,
+            exp: 9_999_999_999,
+            holder_jwk: SoftwareKey::generate().public_jwk().unwrap(),
+            disclosable: Map::new(),
+            visible: Map::new(),
+        };
+        let sd_jwt = issue(params, &key).unwrap();
+        assert_eq!(status_reference(&sd_jwt).unwrap(), None);
+    }
 }
 
 #[cfg(test)]
