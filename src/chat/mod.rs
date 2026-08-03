@@ -600,17 +600,35 @@ impl Session {
     ///
     /// Every member computes this from the same two numbers, which is what
     /// makes them agree without anybody to ask.
+    /// **The order is total: two members never tie.** This matters more than it
+    /// looks. Both sides of a race yield to a lower rank, so a tie is not a
+    /// coin toss — it is both of them concluding they lost, both rolling back,
+    /// both re-applying, and the two branches swapping places for ever. The
+    /// room never converges and no error is raised anywhere, because each side
+    /// is following the rule correctly.
+    ///
+    /// Ties were reachable two ways. The rotation was written as
+    /// `leaf.wrapping_sub(epoch) % size`, which is arithmetic modulo 2^64 and
+    /// only agrees with a rotation modulo `size` when `size` divides 2^64 — so
+    /// it was right for 2, 4, 8 members and wrong for 3, 5, 6, where two leaves
+    /// collided. And leaf indices outlive the members in them: a tree that has
+    /// had removals holds blanks, so a leaf index can exceed `size` and two
+    /// live leaves can land on the same rotation however it is computed.
+    ///
+    /// So the rotation decides, and the leaf index — unique to a member by
+    /// construction — breaks what is left. Both are known to everybody and
+    /// chosen by nobody.
     pub fn rank(&self, room_id: &[u8], leaf: u32) -> Result<u64> {
         let group = self.load(room_id)?;
         let size = group.members().count() as u64;
         if size == 0 {
             return Ok(u64::MAX);
         }
-        let epoch = group.epoch().as_u64();
-        // Wrapping on purpose: this is a rotation, and a leaf below the epoch
-        // has to come back round rather than saturate where it would win for
-        // ever.
-        Ok(u64::from(leaf).wrapping_sub(epoch) % size)
+        let epoch = group.epoch().as_u64() % size;
+        let rotated = (u64::from(leaf) % size + size - epoch) % size;
+        // Room to hold every leaf index below the rotation, so comparing the
+        // one number compares the pair.
+        Ok(rotated << 32 | u64::from(leaf))
     }
 
     /// What a member needs to let themselves back into a room (ADR 0022).
@@ -718,6 +736,96 @@ mod tests {
 
         assert_eq!(joined, group, "both sides must agree on the group id");
         (alice, bob, group)
+    }
+
+    /// A room of three, which is the size the rank arithmetic was wrong at.
+    fn trio() -> (Session, Session, Session, Vec<u8>) {
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new(b"did:peer:bob").unwrap();
+        let mut carol = Session::new(b"did:peer:carol").unwrap();
+
+        let room = alice.create_room().unwrap();
+        let invitation = alice
+            .add_members(
+                &room,
+                &[
+                    bob.key_package().unwrap(),
+                    carol.key_package().unwrap(),
+                ],
+            )
+            .unwrap();
+        bob.join(&invitation.welcome).unwrap();
+        carol.join(&invitation.welcome).unwrap();
+        (alice, bob, carol, room)
+    }
+
+    /// **No two members may ever rank the same.**
+    ///
+    /// A tie is not a coin toss. Both sides of a race yield to a lower rank, so
+    /// equal ranks mean both roll back, both re-apply, and the two branches
+    /// swap places for ever — a room that never converges, with no error
+    /// anywhere, because each side is obeying the rule.
+    ///
+    /// This is asserted over a real three-member group rather than by
+    /// recomputing the formula, because recomputing it is how the bug survived:
+    /// `leaf.wrapping_sub(epoch) % size` is arithmetic modulo 2^64, which
+    /// agrees with a rotation modulo `size` only when `size` divides 2^64. It
+    /// was therefore correct for two members and wrong for three.
+    #[test]
+    fn no_two_members_of_a_room_ever_rank_the_same() {
+        let (alice, _bob, _carol, room) = trio();
+
+        let ranks: Vec<u64> = (0..3).map(|leaf| alice.rank(&room, leaf).unwrap()).collect();
+        assert_eq!(
+            {
+                let mut sorted = ranks.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                sorted.len()
+            },
+            3,
+            "three members produced fewer than three ranks: {ranks:?}"
+        );
+
+        // And exactly one of any pair wins, which is what the caller relies on.
+        for a in 0..3u32 {
+            for b in 0..3u32 {
+                if a == b {
+                    continue;
+                }
+                let (x, y) = (
+                    alice.rank(&room, a).unwrap(),
+                    alice.rank(&room, b).unwrap(),
+                );
+                assert!(
+                    (x < y) != (y < x),
+                    "leaves {a} and {b} did not settle: {x} vs {y}"
+                );
+            }
+        }
+    }
+
+    /// Everybody must reach the same verdict from their own copy of the room,
+    /// because there is nobody to ask.
+    #[test]
+    fn every_member_agrees_on_who_wins_a_race() {
+        let (alice, bob, carol, room) = trio();
+
+        for a in 0..3u32 {
+            for b in 0..3u32 {
+                let verdict = |s: &Session| s.rank(&room, a).unwrap() < s.rank(&room, b).unwrap();
+                assert_eq!(
+                    verdict(&alice),
+                    verdict(&bob),
+                    "alice and bob disagreed about leaves {a} and {b}"
+                );
+                assert_eq!(
+                    verdict(&alice),
+                    verdict(&carol),
+                    "alice and carol disagreed about leaves {a} and {b}"
+                );
+            }
+        }
     }
 
     /// The premise repair rests on, pinned against OpenMLS rather than against
