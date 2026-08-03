@@ -575,6 +575,11 @@ impl Session {
         Ok(u64::from(leaf).wrapping_sub(epoch) % size)
     }
 
+    /// Which epoch a room is at.
+    pub fn epoch(&self, room_id: &[u8]) -> Result<u64> {
+        Ok(self.load(room_id)?.epoch().as_u64())
+    }
+
     /// This device's own leaf in a room, to rank against somebody else's.
     pub fn own_leaf(&self, room_id: &[u8]) -> Result<u32> {
         Ok(self.load(room_id)?.own_leaf_index().u32())
