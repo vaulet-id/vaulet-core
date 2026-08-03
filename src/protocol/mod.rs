@@ -962,7 +962,7 @@ pub mod oid4vp {
         #[test]
         fn presentation_request_serde_and_required_vcts() {
             let req = PresentationRequest {
-                form_id: "codefin-identity".into(),
+                manifest_id: "codefin-identity".into(),
                 required: vec![
                     RequestedCredential {
                         vct: "https://issuer.example/credential/verified_email".into(),
@@ -978,7 +978,7 @@ pub mod oid4vp {
                 audience: "https://issuer.example".into(),
             };
             let v = serde_json::to_value(&req).unwrap();
-            assert_eq!(v["form_id"], json!("codefin-identity"));
+            assert_eq!(v["manifest_id"], json!("codefin-identity"));
             assert_eq!(v["required"][0]["vct"], json!("https://issuer.example/credential/verified_email"));
             assert_eq!(v["required"][0]["claims"][0], json!("email"));
             assert_eq!(v["nonce"], json!("vp-nonce-123"));
