@@ -188,10 +188,23 @@ pub struct RoomAddressBody {
     /// `base64url(sha256(public_key))`, the same construction as every other
     /// identifier here.
     pub inbox: String,
-    /// SEC1-uncompressed, base64url.
-    pub public_key: String,
+    /// The box's **signing** key, SEC1-uncompressed, base64url. What creates the
+    /// box on the deposit that needs it (ADR 0018); authorises nothing, since
+    /// the address is its hash.
+    pub inbox_key: String,
+    /// The **sealing** key, SEC1-uncompressed, base64url. A different key from
+    /// the one above on purpose: signing challenges and agreeing HPKE secrets
+    /// with one key is reuse across two algorithms.
+    pub sealing_key: String,
     /// Which mediator holds it. Members may be on different ones.
     pub mediator: String,
+    /// Their wake ticket, base64url, or empty when they have no push
+    /// registration.
+    ///
+    /// **Opaque to everyone who carries it** — only the relay holds a key that
+    /// opens it (ADR 0016) — which is why it can travel in a room without
+    /// telling the room's members anything about each other's devices.
+    pub push_ticket: String,
 }
 
 /// The body of [`ROOM_NAME`].

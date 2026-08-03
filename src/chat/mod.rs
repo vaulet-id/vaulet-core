@@ -110,6 +110,14 @@ pub enum Received {
     Application {
         room_id: Vec<u8>,
         plaintext: Vec<u8>,
+        /// Who sent it, **authenticated by MLS** — this is not a field anybody
+        /// filled in, it is the credential the ratchet verified.
+        ///
+        /// In a room of two, `mine` answers the same question and this adds
+        /// nothing. In a room of more, it is the only thing that says who spoke,
+        /// and it must never be confused with the display name beside it, which
+        /// its owner chose and may change (ADR 0015).
+        sender: Vec<u8>,
     },
     /// A membership or key change that has been applied. The epoch has moved,
     /// so any key an ex-member held is now useless.
@@ -402,10 +410,14 @@ impl Session {
             }
         };
 
+        // Taken before the content is consumed, because `into_content` moves it.
+        let sender = processed.credential().serialized_content().to_vec();
+
         match processed.into_content() {
             ProcessedMessageContent::ApplicationMessage(m) => Ok(Received::Application {
                 room_id,
                 plaintext: m.into_bytes(),
+                sender,
             }),
             ProcessedMessageContent::StagedCommitMessage(commit) => {
                 // Applying the commit is what advances the epoch — and what
@@ -585,7 +597,7 @@ mod tests {
 
         let wire = alice.send(&group, b"prachum 6 mong").unwrap();
         match bob.receive(&wire).unwrap() {
-            Received::Application { plaintext, room_id } => {
+            Received::Application { plaintext, room_id, .. } => {
                 assert_eq!(plaintext, b"prachum 6 mong");
                 assert_eq!(room_id, group);
             }
@@ -762,5 +774,53 @@ mod tests {
             Session::restore(KEY, &sealed),
             Err(ChatError::UnsupportedStateVersion(99))
         ));
+    }
+
+    /// A room of more than two is only a room if you can tell who spoke, and
+    /// the answer has to come from MLS rather than from anything a sender
+    /// filled in — a self-reported name in a group is a name anybody can wear.
+    ///
+    /// Pinned against what OpenMLS actually puts in the credential, with three
+    /// real sessions and only wire bytes between them.
+    #[test]
+    fn a_room_says_who_spoke_and_mls_is_what_says_it() {
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new(b"did:peer:bob").unwrap();
+        let mut carol = Session::new(b"did:peer:carol").unwrap();
+
+        let room = alice.create_room().unwrap();
+        let to_bob = alice
+            .add_member(&room, &bob.key_package().unwrap())
+            .unwrap();
+        bob.join(&to_bob.welcome).unwrap();
+
+        let to_carol = alice
+            .add_member(&room, &carol.key_package().unwrap())
+            .unwrap();
+        carol.join(&to_carol.welcome).unwrap();
+        // Bob has to see the commit that added Carol, or he stays an epoch
+        // behind and reads nothing after it.
+        bob.receive(&to_carol.commit).unwrap();
+
+        // Bob speaks; Carol must be able to say it was Bob and not Alice.
+        let wire = bob.send(&room, b"raw six").unwrap();
+        match carol.receive(&wire).unwrap() {
+            Received::Application {
+                plaintext, sender, ..
+            } => {
+                assert_eq!(plaintext, b"raw six");
+                assert_eq!(
+                    sender, b"did:peer:bob",
+                    "the sender must be the member MLS authenticated"
+                );
+            }
+            other => panic!("expected an application message, got {other:?}"),
+        }
+
+        // And Alice, in the same room, agrees about who it was.
+        match alice.receive(&wire).unwrap() {
+            Received::Application { sender, .. } => assert_eq!(sender, b"did:peer:bob"),
+            other => panic!("expected an application message, got {other:?}"),
+        }
     }
 }
