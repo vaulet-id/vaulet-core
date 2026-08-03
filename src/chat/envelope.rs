@@ -80,6 +80,16 @@ pub enum Kind {
     /// consumed on joining, so the one already used to open the broken room can
     /// never open a second: repair has to be an exchange, not a retry.
     Repair = 5,
+    /// "I cannot read this room any more — send me what I need to get back in"
+    /// (ADR 0022).
+    ///
+    /// **Outside MLS on purpose**, because the sender cannot decrypt anything
+    /// inside it. That is the whole reason a room inbox is HPKE and owes
+    /// nothing to the ratchet: it keeps working for exactly the person who
+    /// needs it most.
+    RoomRejoin = 6,
+    /// The answer: a room info the asker can rejoin with.
+    RoomInfo = 7,
 }
 
 impl Kind {

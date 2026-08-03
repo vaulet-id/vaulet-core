@@ -575,6 +575,75 @@ impl Session {
         Ok(u64::from(leaf).wrapping_sub(epoch) % size)
     }
 
+    /// What a member needs to let themselves back into a room (ADR 0022).
+    ///
+    /// Handed to somebody whose ratchet has fallen behind, over the room inbox
+    /// — which is HPKE and owes nothing to MLS, so it still works for a member
+    /// who can decrypt nothing. This is the channel Signal heals over, and it
+    /// was already here.
+    ///
+    /// It carries the ratchet tree, because rooms are created asking for it, so
+    /// the rejoiner needs nothing else.
+    pub fn room_info(&self, room_id: &[u8]) -> Result<Vec<u8>> {
+        self.load(room_id)?
+            .export_group_info(self.provider.crypto(), &self.signer, true)
+            .map_err(mls)?
+            .tls_serialize_detached()
+            .map_err(mls)
+    }
+
+    /// Let ourselves back into a room we can no longer read.
+    ///
+    /// **Nobody has to be awake for this.** An external commit is made by the
+    /// joiner, so healing does not wait on whoever created the room — which
+    /// would make a person the single point of failure for everybody else's
+    /// broken ratchet.
+    ///
+    /// Our old leaf goes with it: OpenMLS removes any member holding the same
+    /// signature key in the same commit, so this replaces us rather than
+    /// seating us twice.
+    ///
+    /// The commit must reach every member, or they stay at the old epoch and
+    /// nothing we say afterwards can be read — which would be the same failure
+    /// pointed the other way.
+    pub fn rejoin(&mut self, room_info: &[u8]) -> Result<Invitation> {
+        let info = MlsMessageIn::tls_deserialize_exact(room_info)
+            .map_err(|_| ChatError::Malformed("room info"))?
+            .extract();
+        let MlsMessageBodyIn::GroupInfo(info) = info else {
+            return Err(ChatError::Malformed("not a room info"));
+        };
+
+        let (mut group, commit, _) = MlsGroup::join_by_external_commit(
+            &self.provider,
+            &self.signer,
+            None,
+            info,
+            &MlsGroupJoinConfig::builder()
+                .use_ratchet_tree_extension(true)
+                .padding_size(PADDING)
+                .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+                .build(),
+            None,
+            None,
+            b"",
+            self.credential.clone(),
+        )
+        .map_err(mls)?;
+
+        // Merged here, unlike an add: an external commit cannot lose a race it
+        // is not in. It carries its own epoch forward from the group info, and
+        // a member who has fallen behind has nothing anybody could be racing.
+        group.merge_pending_commit(&self.provider).map_err(mls)?;
+
+        Ok(Invitation {
+            commit: commit.tls_serialize_detached().map_err(mls)?,
+            // An external commit invites nobody, so there is no Welcome. The
+            // field stays for one shape across both ways into a room.
+            welcome: Vec::new(),
+        })
+    }
+
     /// Which epoch a room is at.
     pub fn epoch(&self, room_id: &[u8]) -> Result<u64> {
         Ok(self.load(room_id)?.epoch().as_u64())
@@ -995,5 +1064,76 @@ mod tests {
 
     fn carol_package(mut session: Session) -> Vec<u8> {
         session.key_package().unwrap()
+    }
+
+    /// **A member whose ratchet has fallen behind lets themselves back in**,
+    /// and nobody had to be awake to allow it (ADR 0022).
+    ///
+    /// The break is staged the way it really happens: a member goes back to a
+    /// state from before a commit they never received, so their epoch is behind
+    /// and nothing anybody says decrypts. Signal heals this over the pairwise
+    /// channel it always has; the room inbox is ours, and it owes nothing to
+    /// MLS, so it still works for somebody who can read nothing.
+    #[test]
+    fn a_member_who_fell_behind_lets_themselves_back_in() {
+        let key = [9u8; STATE_KEY_LEN];
+        let (mut alice, mut bob, room) = pair();
+
+        // Bob's state from before he sees what comes next.
+        let bob_behind = bob.export(&key).unwrap();
+
+        let carol = Session::new(b"did:peer:carol").unwrap();
+        let adding = alice
+            .add_member(&room, &carol_package(carol))
+            .unwrap();
+        bob.receive(&adding.commit).unwrap();
+
+        // Bob is restored to before that commit: an epoch behind, exactly as if
+        // it had expired out of the queue while he was away.
+        let mut bob = Session::restore(&key, &bob_behind).unwrap();
+        let wire = alice.send(&room, b"can you hear me").unwrap();
+        assert!(
+            matches!(
+                bob.receive(&wire).unwrap(),
+                Received::Undecryptable { .. }
+            ),
+            "the break has to be real, or this proves nothing"
+        );
+
+        // Alice hands over what he needs, over a channel that is not MLS.
+        let info = alice.room_info(&room).unwrap();
+        let back = bob.rejoin(&info).unwrap();
+
+        // Everybody else applies his commit, and the room converges.
+        alice.receive(&back.commit).unwrap();
+
+        let mut hers = alice.members(&room).unwrap();
+        let mut his = bob.members(&room).unwrap();
+        hers.sort();
+        his.sort();
+        assert_eq!(hers, his, "the room has to agree about who is in it");
+        assert_eq!(
+            his.iter().filter(|m| *m == b"did:peer:bob").count(),
+            1,
+            "rejoining must replace the old leaf, not sit beside it"
+        );
+
+        // And it works in both directions afterwards, which is the point.
+        let after = alice.send(&room, b"there you are").unwrap();
+        match bob.receive(&after).unwrap() {
+            Received::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"there you are")
+            }
+            other => panic!("still broken after healing: {other:?}"),
+        }
+
+        let reply = bob.send(&room, b"back now").unwrap();
+        match alice.receive(&reply).unwrap() {
+            Received::Application { plaintext, sender, .. } => {
+                assert_eq!(plaintext, b"back now");
+                assert_eq!(sender, b"did:peer:bob");
+            }
+            other => panic!("the healed member cannot be heard: {other:?}"),
+        }
     }
 }
