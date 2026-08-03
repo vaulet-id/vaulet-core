@@ -270,9 +270,12 @@ mod tests {
     /// the JSON rather than against the struct.
     #[test]
     fn the_type_field_is_called_type_on_the_wire() {
-        let json: serde_json::Value =
-            serde_json::from_slice(&Message::new(TYPING, 1, serde_json::json!({})).encode().unwrap())
-                .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(
+            &Message::new(TYPING, 1, serde_json::json!({}))
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(json["type"], TYPING);
         assert!(json.get("kind").is_none());
     }

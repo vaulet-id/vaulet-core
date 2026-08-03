@@ -360,7 +360,15 @@ mod tests {
         assert_eq!(private, room_envelope_keypair(SEED, room).unwrap().1);
 
         // Another room, and another member, each get their own.
-        assert_ne!(mine, room_envelope_keypair(SEED, b"another room").unwrap().0);
-        assert_ne!(mine, room_envelope_keypair(b"another seed entirely", room).unwrap().0);
+        assert_ne!(
+            mine,
+            room_envelope_keypair(SEED, b"another room").unwrap().0
+        );
+        assert_ne!(
+            mine,
+            room_envelope_keypair(b"another seed entirely", room)
+                .unwrap()
+                .0
+        );
     }
 }
