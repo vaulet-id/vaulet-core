@@ -90,6 +90,17 @@ pub enum Kind {
     RoomRejoin = 6,
     /// The answer: a room info the asker can rejoin with.
     RoomInfo = 7,
+    /// Where to write to everybody already in a room, handed to somebody who
+    /// has just been invited to it (ADR 0022).
+    ///
+    /// **Outside MLS, and it has to be.** A room address is announced inside
+    /// the room, which means a member who has just joined has heard nobody's —
+    /// and cannot announce their own, because they have nowhere to send it. The
+    /// inviter is the only party who holds both ends: every member's address,
+    /// and the contact inbox the invitation went through. So the roster travels
+    /// beside the Welcome, and after that the newcomer can announce normally
+    /// and everybody learns them.
+    RoomRoster = 8,
 }
 
 impl Kind {
@@ -100,6 +111,9 @@ impl Kind {
             3 => Ok(Kind::Introduction),
             4 => Ok(Kind::Profile),
             5 => Ok(Kind::Repair),
+            6 => Ok(Kind::RoomRejoin),
+            7 => Ok(Kind::RoomInfo),
+            8 => Ok(Kind::RoomRoster),
             _ => Err(ChatError::Malformed("unknown envelope kind")),
         }
     }
@@ -269,5 +283,36 @@ mod tests {
         let once = seal(&public, Kind::MlsMessage, b"same").unwrap();
         let twice = seal(&public, Kind::MlsMessage, b"same").unwrap();
         assert_ne!(once, twice);
+    }
+
+    /// **Every kind survives a round trip**, which is not as obvious as it
+    /// sounds: the variants and the byte they decode from are two lists, and
+    /// adding to one is not adding to the other.
+    ///
+    /// It has already gone wrong exactly that way. `RoomRejoin` and `RoomInfo`
+    /// were added to the enum and used all the way through the app, and
+    /// `from_byte` never learned them — so a room that needed healing would
+    /// have failed with "unknown envelope kind" at the one moment it mattered,
+    /// and nothing anywhere would have said why. A harness talking to a real
+    /// mediator found it; no test did.
+    #[test]
+    fn every_kind_comes_back_as_itself() {
+        let (public, private) = keypair(b"a seed", 0).unwrap();
+
+        for kind in [
+            Kind::Welcome,
+            Kind::MlsMessage,
+            Kind::Introduction,
+            Kind::Profile,
+            Kind::Repair,
+            Kind::RoomRejoin,
+            Kind::RoomInfo,
+            Kind::RoomRoster,
+        ] {
+            let sealed = seal(&public, kind, b"payload").unwrap();
+            let (back, payload) = open(&private, &sealed).unwrap();
+            assert_eq!(back, kind, "{kind:?} did not survive the wire");
+            assert_eq!(payload, b"payload");
+        }
     }
 }

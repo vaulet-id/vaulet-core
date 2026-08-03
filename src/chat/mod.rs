@@ -330,6 +330,44 @@ impl Session {
         Ok(group.group_id().as_slice().to_vec())
     }
 
+    /// Add several people in **one** commit.
+    ///
+    /// Not a convenience. Adding them one at a time means each commit has to
+    /// reach everybody already in the room — including the person added a
+    /// moment ago, who has announced no address yet and so cannot be reached at
+    /// all. They are left an epoch behind, permanently, and the first thing
+    /// they say is unreadable to everybody else.
+    ///
+    /// One commit puts every newcomer at the same epoch as everybody else, and
+    /// there is no window in which somebody is a member and unreachable.
+    pub fn add_members(&mut self, room_id: &[u8], key_packages: &[Vec<u8>]) -> Result<Invitation> {
+        let mut validated = Vec::with_capacity(key_packages.len());
+        for raw in key_packages {
+            let body = MlsMessageIn::tls_deserialize_exact(raw)
+                .map_err(|_| ChatError::Malformed("key package"))?
+                .extract();
+            let MlsMessageBodyIn::KeyPackage(key_package) = body else {
+                return Err(ChatError::Malformed("not a key package"));
+            };
+            validated.push(
+                key_package
+                    .validate(self.provider.crypto(), ProtocolVersion::Mls10)
+                    .map_err(mls)?,
+            );
+        }
+
+        let mut group = self.load(room_id)?;
+        let (commit, welcome, _) = group
+            .add_members(&self.provider, &self.signer, &validated)
+            .map_err(mls)?;
+        group.merge_pending_commit(&self.provider).map_err(mls)?;
+
+        Ok(Invitation {
+            commit: commit.tls_serialize_detached().map_err(mls)?,
+            welcome: welcome.tls_serialize_detached().map_err(mls)?,
+        })
+    }
+
     pub fn add_member(&mut self, room_id: &[u8], key_package: &[u8]) -> Result<Invitation> {
         let body = MlsMessageIn::tls_deserialize_exact(key_package)
             .map_err(|_| ChatError::Malformed("key package"))?
@@ -1083,9 +1121,7 @@ mod tests {
         let bob_behind = bob.export(&key).unwrap();
 
         let carol = Session::new(b"did:peer:carol").unwrap();
-        let adding = alice
-            .add_member(&room, &carol_package(carol))
-            .unwrap();
+        let adding = alice.add_member(&room, &carol_package(carol)).unwrap();
         bob.receive(&adding.commit).unwrap();
 
         // Bob is restored to before that commit: an epoch behind, exactly as if
@@ -1093,10 +1129,7 @@ mod tests {
         let mut bob = Session::restore(&key, &bob_behind).unwrap();
         let wire = alice.send(&room, b"can you hear me").unwrap();
         assert!(
-            matches!(
-                bob.receive(&wire).unwrap(),
-                Received::Undecryptable { .. }
-            ),
+            matches!(bob.receive(&wire).unwrap(), Received::Undecryptable { .. }),
             "the break has to be real, or this proves nothing"
         );
 
@@ -1129,7 +1162,9 @@ mod tests {
 
         let reply = bob.send(&room, b"back now").unwrap();
         match alice.receive(&reply).unwrap() {
-            Received::Application { plaintext, sender, .. } => {
+            Received::Application {
+                plaintext, sender, ..
+            } => {
                 assert_eq!(plaintext, b"back now");
                 assert_eq!(sender, b"did:peer:bob");
             }
