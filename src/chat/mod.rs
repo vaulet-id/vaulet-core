@@ -307,6 +307,22 @@ impl Session {
                 // carrying it in the Welcome is what makes an invitation a
                 // single self-contained blob the mediator can hold.
                 .use_ratchet_tree_extension(true)
+                // **Commits are framed in the clear; messages are not.** The
+                // policy governs handshake messages only — `create_message`
+                // encrypts directly and never consults it — so what this
+                // exposes is who committed and what they changed, never a word
+                // anybody said.
+                //
+                // It is what makes the tie-break possible at all. Resolving two
+                // commits at one epoch means ranking their senders, and by the
+                // time a competing commit arrives we have moved to our own
+                // epoch and can no longer decrypt one framed privately. The
+                // header of a public one stays readable.
+                //
+                // It costs nothing here: every commit travels sealed to one
+                // recipient (HPKE), so the mediator sees none of it, and the
+                // only readers are members who are in the room already.
+                .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
                 .build(),
             self.credential.clone(),
         )
@@ -361,6 +377,11 @@ impl Session {
             &MlsGroupJoinConfig::builder()
                 .use_ratchet_tree_extension(true)
                 .padding_size(PADDING)
+                // The joiner has to accept the framing the room uses, or every
+                // commit after the one that let them in is refused and they sit
+                // an epoch behind for ever. See `create_room` for what it is
+                // and what it does not expose.
+                .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
                 .build(),
             welcome,
             None,
@@ -496,6 +517,69 @@ impl Session {
             .collect())
     }
 
+    /// Read a commit's header without applying it, or touching any state.
+    ///
+    /// **The tie-break has to happen before anything is applied**, and by the
+    /// time a competing commit arrives we have already moved to our own epoch —
+    /// so `receive` would reject it as stale and tell us nothing about who sent
+    /// it. This reads what the header says, which is readable whether or not
+    /// the body can be opened: the epoch it was built at, and the leaf that
+    /// built it.
+    ///
+    /// `None` for anything that is not a member's commit — an external sender,
+    /// or a message that is not a commit at all. Neither can win a race.
+    pub fn peek_commit(&self, message: &[u8]) -> Option<(u64, u32)> {
+        let message = MlsMessageIn::tls_deserialize_exact(message)
+            .ok()?
+            .try_into_protocol_message()
+            .ok()?;
+        let epoch = message.epoch().as_u64();
+        // Only a publicly framed commit can be read from outside its epoch, and
+        // that is why rooms are created asking for one. A room made before that
+        // — or by another client — frames commits privately, and this says so
+        // by answering nothing rather than by guessing.
+        let ProtocolMessage::PublicMessage(public) = message else {
+            return None;
+        };
+        if public.content_type() != ContentType::Commit {
+            return None;
+        }
+        match public.sender() {
+            Sender::Member(leaf) => Some((epoch, leaf.u32())),
+            _ => None,
+        }
+    }
+
+    /// Where a leaf stands in the order for this room's current epoch. **Lowest
+    /// wins**, and the order rotates every epoch.
+    ///
+    /// `(leaf - epoch) mod size`. The usual rule is the lowest hash of the
+    /// commit bytes, and it is **grindable**: a member who wants to can search
+    /// for a commit that hashes low and win every race, which is a quiet veto
+    /// over everybody else's membership changes. A leaf index and an epoch are
+    /// known to every member and chosen by none of them, so rotating by epoch
+    /// moves the order under everyone and costs one subtraction.
+    ///
+    /// Every member computes this from the same two numbers, which is what
+    /// makes them agree without anybody to ask.
+    pub fn rank(&self, room_id: &[u8], leaf: u32) -> Result<u64> {
+        let group = self.load(room_id)?;
+        let size = group.members().count() as u64;
+        if size == 0 {
+            return Ok(u64::MAX);
+        }
+        let epoch = group.epoch().as_u64();
+        // Wrapping on purpose: this is a rotation, and a leaf below the epoch
+        // has to come back round rather than saturate where it would win for
+        // ever.
+        Ok(u64::from(leaf).wrapping_sub(epoch) % size)
+    }
+
+    /// This device's own leaf in a room, to rank against somebody else's.
+    pub fn own_leaf(&self, room_id: &[u8]) -> Result<u32> {
+        Ok(self.load(room_id)?.own_leaf_index().u32())
+    }
+
     fn load(&self, room_id: &[u8]) -> Result<MlsGroup> {
         MlsGroup::load(self.provider.storage(), &GroupId::from_slice(room_id))
             .map_err(mls)?
@@ -597,7 +681,9 @@ mod tests {
 
         let wire = alice.send(&group, b"prachum 6 mong").unwrap();
         match bob.receive(&wire).unwrap() {
-            Received::Application { plaintext, room_id, .. } => {
+            Received::Application {
+                plaintext, room_id, ..
+            } => {
                 assert_eq!(plaintext, b"prachum 6 mong");
                 assert_eq!(room_id, group);
             }
@@ -822,5 +908,87 @@ mod tests {
             Received::Application { sender, .. } => assert_eq!(sender, b"did:peer:bob"),
             other => panic!("expected an application message, got {other:?}"),
         }
+    }
+
+    /// **Two people change the room in the same moment, and both end up in the
+    /// same room.** The rule that decides it is ADR 0022's, and this is the
+    /// test the ADR asked for: real sessions, real commits, only wire bytes
+    /// between them, and the outcome read out of OpenMLS rather than out of our
+    /// reading of it.
+    ///
+    /// The rollback is done the way the app does it — by keeping the sealed
+    /// state from before the change and restoring it — because a pending commit
+    /// cannot be held across the boundary the app works over.
+    #[test]
+    fn two_commits_at_one_epoch_leave_everybody_in_the_same_room() {
+        let key = [7u8; STATE_KEY_LEN];
+        let (mut alice, mut bob, room) = pair();
+
+        let carol = Session::new(b"did:peer:carol").unwrap();
+        let dave = Session::new(b"did:peer:dave").unwrap();
+
+        // Both keep what they were before touching anything. This is the whole
+        // mechanism: MLS cannot un-apply a commit, so the loser goes back to
+        // the blob it had and replays the winner's.
+        let alice_before = alice.export(&key).unwrap();
+        let bob_before = bob.export(&key).unwrap();
+
+        let from_alice = alice.add_member(&room, &mut carol_package(carol)).unwrap();
+        let from_bob = bob.add_member(&room, &mut carol_package(dave)).unwrap();
+
+        // Neither has seen the other's yet, so both believe they moved.
+        assert_eq!(alice.members(&room).unwrap().len(), 3);
+        assert_eq!(bob.members(&room).unwrap().len(), 3);
+
+        // Each ranks the other's commit against its own. Both compute it from
+        // the same two numbers, so they must reach opposite conclusions.
+        let (their_epoch, their_leaf) = alice.peek_commit(&from_bob.commit).unwrap();
+        let alice_wins = {
+            let mine = Session::restore(&key, &alice_before).unwrap();
+            mine.rank(&room, mine.own_leaf(&room).unwrap()).unwrap()
+                < mine.rank(&room, their_leaf).unwrap()
+        };
+        assert_eq!(their_epoch, 1, "both were built at the epoch they shared");
+
+        let (_, alices_leaf) = bob.peek_commit(&from_alice.commit).unwrap();
+        let bob_wins = {
+            let mine = Session::restore(&key, &bob_before).unwrap();
+            mine.rank(&room, mine.own_leaf(&room).unwrap()).unwrap()
+                < mine.rank(&room, alices_leaf).unwrap()
+        };
+        assert_ne!(
+            alice_wins, bob_wins,
+            "the rule must pick exactly one winner, or both roll back and the \
+             room splits anyway"
+        );
+
+        // The loser goes back and replays the winner's commit.
+        if alice_wins {
+            bob = Session::restore(&key, &bob_before).unwrap();
+            bob.receive(&from_alice.commit).unwrap();
+        } else {
+            alice = Session::restore(&key, &alice_before).unwrap();
+            alice.receive(&from_bob.commit).unwrap();
+        }
+
+        let mut theirs = alice.members(&room).unwrap();
+        let mut ours = bob.members(&room).unwrap();
+        theirs.sort();
+        ours.sort();
+        assert_eq!(theirs, ours, "both sides must be in the same room");
+        assert_eq!(theirs.len(), 3, "the winner's addition, and only that one");
+
+        // And the room still works: the winner can speak and the loser reads it.
+        let wire = alice.send(&room, b"still here").unwrap();
+        match bob.receive(&wire).unwrap() {
+            Received::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"still here")
+            }
+            other => panic!("the room stopped working: {other:?}"),
+        }
+    }
+
+    fn carol_package(mut session: Session) -> Vec<u8> {
+        session.key_package().unwrap()
     }
 }
