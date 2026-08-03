@@ -638,9 +638,9 @@ pub mod oid4vp {
     //! The three-round dance (all HTTP in Dart; the FFI only runs
     //! `credential::present` / `verify_presentation`, network-free per ADR 0004):
     //!   1. Wallet asks for the ask + a fresh nonce:
-    //!      `POST /api/v1/forms/{form_id}/presentation-request` → [`PresentationRequest`].
+    //!      `POST /api/v1/manifests/{manifest_id}/request` → [`PresentationRequest`].
     //!   2. Wallet presents one VP per required credential:
-    //!      `POST /api/v1/forms/{form_id}/satisfy` body [`SatisfyRequest`].
+    //!      `POST /api/v1/manifests/{manifest_id}/satisfy` body [`SatisfyRequest`].
     //!   3. Form owner verifies each VP and returns an OID4VCI offer for the
     //!      output: [`SatisfyResponse`]; the wallet claims it (chain).
     //!
@@ -744,14 +744,14 @@ pub mod oid4vp {
     }
 
     /// What a Form asks for before it will issue its output (the OID4VP ask).
-    /// The form owner mints it at `POST /api/v1/forms/{form_id}/presentation-request`
+    /// The request owner mints it at `POST /api/v1/manifests/{manifest_id}/request`
     /// (minting a fresh single-use `nonce` the way the token endpoint mints
     /// `c_nonce`); it is returned to the wallet and also drives the wallet's
     /// present step and the D13 consent sheet.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct PresentationRequest {
         /// The form this ask belongs to (echoes the URL path segment).
-        pub form_id: String,
+        pub manifest_id: String,
         /// Each required input credential + the claims to disclose. The wallet
         /// returns exactly one VP per entry (see [`SatisfyRequest::presentations`]).
         ///
@@ -786,7 +786,7 @@ pub mod oid4vp {
 
     /// The wallet's answer to a [`PresentationRequest`]: one compact
     /// KB-JWT-bearing SD-JWT presentation per required credential, plus the nonce
-    /// they were all bound to. POSTed to `POST /api/v1/forms/{form_id}/satisfy`.
+    /// they were all bound to. POSTed to `POST /api/v1/manifests/{manifest_id}/satisfy`.
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct SatisfyRequest {
         /// One presentation per [`PresentationRequest::required`] entry, each
