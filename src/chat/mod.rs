@@ -437,7 +437,16 @@ impl Session {
             return Err(ChatError::Malformed("not a welcome"));
         };
 
-        let group = StagedWelcome::new_from_welcome(
+        // **A group we already hold cannot be staged over**, and OpenMLS says so
+        // before the Welcome can be read far enough to learn which group it is
+        // — so this cannot clear the way itself. What makes re-adding work is
+        // that an eviction drops the group when it is applied; see `receive`.
+        //
+        // The clear below is the belt to that brace: a Welcome is authority to
+        // be in the room, since it is encrypted to an init key only we hold and
+        // whoever sent it has committed us into the group. Only the group is
+        // discarded, never history.
+        let staged = StagedWelcome::new_from_welcome(
             &self.provider,
             &MlsGroupJoinConfig::builder()
                 // See `create_room`: without this, a message from the epoch we
@@ -454,10 +463,14 @@ impl Session {
             welcome,
             None,
         )
-        .map_err(mls)?
-        .into_group(&self.provider)
         .map_err(mls)?;
 
+        let id = staged.group_context().group_id().clone();
+        if let Ok(Some(mut old)) = MlsGroup::load(self.provider.storage(), &id) {
+            old.delete(self.provider.storage()).map_err(mls)?;
+        }
+
+        let group = staged.into_group(&self.provider).map_err(mls)?;
         Ok(group.group_id().as_slice().to_vec())
     }
 
@@ -514,6 +527,24 @@ impl Session {
                 group
                     .merge_staged_commit(&self.provider, *commit)
                     .map_err(mls)?;
+
+                // **A room we have been evicted from is dropped, not kept.**
+                //
+                // It can do nothing: sending raises "used after being evicted"
+                // and nothing further decrypts. Keeping it is not merely tidy —
+                // it is what made being *re-added* impossible, because OpenMLS
+                // refuses to stage a Welcome for a group id it already holds,
+                // and refuses it before the id can even be read to clear it. So
+                // remove-then-add failed at the invitee's end, after the
+                // inviter had committed and spent their key package: they never
+                // joined, never republished a package, and every later
+                // invitation to them queued behind one that could not succeed.
+                //
+                // Only the group goes. History lives above this layer and is
+                // not keyed by epoch, so what was said stays readable.
+                if !group.is_active() {
+                    group.delete(self.provider.storage()).map_err(mls)?;
+                }
                 Ok(Received::RoomChanged { room_id })
             }
             ProcessedMessageContent::ProposalMessage(_)
@@ -797,6 +828,42 @@ mod tests {
 
         assert_eq!(joined, group, "both sides must agree on the group id");
         (alice, bob, group)
+    }
+
+    /// **Removed from a room, and put back into it.**
+    ///
+    /// The Welcome for the second invitation arrives at a device that still
+    /// holds the room it was evicted from, and OpenMLS refuses to build a group
+    /// whose id it already has. That failed at the invitee's end, after the
+    /// inviter had committed and spent their key package — so the invitee never
+    /// joined, never republished a package, and every later invitation to them
+    /// queued behind one that could not succeed. Removed, re-added, and
+    /// silently outside the room for good.
+    #[test]
+    fn somebody_removed_from_a_room_can_be_put_back_into_it() {
+        let (mut alice, mut bob, room) = pair();
+
+        let eviction = alice.remove_member(&room, b"did:peer:bob").unwrap();
+        // Bob applies his own eviction: that is what leaves the dead group in
+        // his storage, and without it there is nothing to collide with.
+        bob.receive(&eviction).unwrap();
+
+        let back = alice
+            .add_members(&room, &[bob.key_package().unwrap()])
+            .unwrap();
+        assert_eq!(
+            bob.join(&back.welcome).unwrap(),
+            room,
+            "a Welcome for a room we were removed from must be joinable"
+        );
+
+        let said = alice.send(&room, b"welcome back").unwrap();
+        match bob.receive(&said).unwrap() {
+            Received::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"welcome back");
+            }
+            other => panic!("re-added and still cannot read: {other:?}"),
+        }
     }
 
     /// **A message overtaken by a commit is still readable.**
