@@ -380,6 +380,40 @@ pub fn wallet_build_connect_jwt(
     build_proof_jwt(&header, &claims, &key)
 }
 
+/// `typ` of the JWT that joins an organisation's key list (ADR 0020).
+///
+/// Its own `typ`, like the others, and here the reason is concrete: a Studio
+/// sign-in and a join are both "this phone signed a nonce Vaulet minted". If
+/// they shared a `typ`, a sign-in proof captured anywhere could be presented as
+/// consent to put that phone in somebody's organisation — and the person would
+/// find out by appearing in a company's public identity document.
+pub const ORG_JOIN_JWT_TYP: &str = "vaulet-org-join+jwt";
+
+/// Sign the invitation that adds this phone to an organisation.
+pub fn wallet_build_join_jwt(
+    secret: &str,
+    audience: &str,
+    nonce: &str,
+    iat: i64,
+) -> Result<String> {
+    use protocol::oid4vci::{build_proof_jwt, ProofJwtClaims, ProofJwtHeader};
+    let key = load_secret_key(secret)?;
+    let header = ProofJwtHeader {
+        typ: ORG_JOIN_JWT_TYP.to_string(),
+        alg: "ES256".to_string(),
+        jwk: Some(key.public_jwk()?),
+        kid: None,
+    };
+    let claims = ProofJwtClaims {
+        iss: None,
+        aud: audience.to_string(),
+        iat,
+        nonce: nonce.to_string(),
+        cb: None,
+    };
+    build_proof_jwt(&header, &claims, &key)
+}
+
 /// Sign the fields a holder typed into a form (ADR 0014).
 ///
 /// `claims` is the JSON object of answers, keyed by the form's JSON Schema
