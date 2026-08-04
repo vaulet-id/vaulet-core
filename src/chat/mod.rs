@@ -50,6 +50,22 @@ const SIGNATURE_SCHEME: SignatureScheme = SignatureScheme::ECDSA_SECP256R1_SHA25
 /// from describing what was said.
 const PADDING: usize = 64;
 
+/// How many epochs back an application message can still be read.
+///
+/// **Zero is the OpenMLS default and it loses messages here.** A commit and the
+/// messages around it are not ordered by anything: the mediator promises no
+/// order, and in a room a commit is fanned out one deposit at a time, so a
+/// message sent just before it routinely arrives just after. With no past
+/// epochs kept, that message fails to decrypt with the same error a replayed
+/// one gives — and a replay is ordinary, so it is dropped in silence and no gap
+/// is drawn.
+///
+/// Three, not more: each retained epoch keeps a secret tree alive, and the
+/// point of the ratchet is that old keys stop existing. Three covers a message
+/// overtaken by a couple of membership changes, which is as far as reordering
+/// realistically goes when everything crosses one mediator.
+const MAX_PAST_EPOCHS: usize = 3;
+
 #[derive(Debug, Error)]
 pub enum ChatError {
     #[error("mls: {0}")]
@@ -298,6 +314,17 @@ impl Session {
             &self.provider,
             &self.signer,
             &MlsGroupCreateConfig::builder()
+                // **A message that merely crossed a commit is not a replay.**
+                // OpenMLS keeps no past epochs by default, so the moment a
+                // commit merges, the previous epoch's secret tree is thrown
+                // away — and a message sent a moment before that commit, its
+                // first and only copy, then fails to decrypt with the same
+                // error a genuine replay gives. This client reads that error as
+                // "at-least-once doing its job" and drops it without a gap,
+                // which is exactly right for a replay and silent loss for this.
+                // A room fans a commit out one deposit at a time, so a message
+                // overtaking one is ordinary rather than rare.
+                .max_past_epochs(MAX_PAST_EPOCHS)
                 .ciphersuite(CIPHERSUITE)
                 // Quantise ciphertext lengths. The mediator sees sizes even
                 // though it sees nothing else, and unpadded sizes distinguish
@@ -413,6 +440,9 @@ impl Session {
         let group = StagedWelcome::new_from_welcome(
             &self.provider,
             &MlsGroupJoinConfig::builder()
+                // See `create_room`: without this, a message from the epoch we
+                // have just left is indistinguishable from a replay.
+                .max_past_epochs(MAX_PAST_EPOCHS)
                 .use_ratchet_tree_extension(true)
                 .padding_size(PADDING)
                 // The joiner has to accept the framing the room uses, or every
@@ -704,6 +734,9 @@ impl Session {
             None,
             info,
             &MlsGroupJoinConfig::builder()
+                // See `create_room`: without this, a message from the epoch we
+                // have just left is indistinguishable from a replay.
+                .max_past_epochs(MAX_PAST_EPOCHS)
                 .use_ratchet_tree_extension(true)
                 .padding_size(PADDING)
                 .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
@@ -764,6 +797,39 @@ mod tests {
 
         assert_eq!(joined, group, "both sides must agree on the group id");
         (alice, bob, group)
+    }
+
+    /// **A message overtaken by a commit is still readable.**
+    ///
+    /// Nothing orders a commit against the messages around it: the mediator
+    /// promises no order, and a room fans a commit out one deposit at a time,
+    /// so a message sent just before one routinely arrives just after. With no
+    /// past epochs kept — the OpenMLS default — that message fails to decrypt
+    /// with the same error a replay gives, and a replay is ordinary traffic
+    /// that this client drops in silence without drawing a gap.
+    #[test]
+    fn a_message_sent_before_a_commit_survives_arriving_after_it() {
+        let (mut alice, mut bob, room) = pair();
+
+        // Bob says something, then Alice changes the room, and the two cross.
+        let overtaken = bob.send(&room, b"sent before the commit").unwrap();
+        let mut carol = Session::new(b"did:peer:carol").unwrap();
+        let invited = alice
+            .add_members(&room, &[carol.key_package().unwrap()])
+            .unwrap();
+        carol.join(&invited.welcome).unwrap();
+
+        // Bob applies the commit first, so the message he sent is now from an
+        // epoch he has left.
+        bob.receive(&invited.commit).unwrap();
+        alice.receive(&invited.commit).unwrap();
+
+        match alice.receive(&overtaken).unwrap() {
+            Received::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"sent before the commit");
+            }
+            other => panic!("the message was lost: {other:?}"),
+        }
     }
 
     /// Group info says which room it is for, before anybody acts on it.
