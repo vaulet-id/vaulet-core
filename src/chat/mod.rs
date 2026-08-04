@@ -515,6 +515,23 @@ impl Session {
         commit.tls_serialize_detached().map_err(mls)
     }
 
+    /// Which room a piece of group info is for, without acting on it.
+    ///
+    /// Needed because group info can arrive on a channel that is not the room's
+    /// own — a member who cannot be addressed inside the room has to be reached
+    /// through the conversation that invited them — and a caller must be able
+    /// to check it is a room they are actually in before letting it move their
+    /// state anywhere.
+    pub fn room_in_group_info(room_info: &[u8]) -> Result<Vec<u8>> {
+        let body = MlsMessageIn::tls_deserialize_exact(room_info)
+            .map_err(|_| ChatError::Malformed("room info"))?
+            .extract();
+        let MlsMessageBodyIn::GroupInfo(info) = body else {
+            return Err(ChatError::Malformed("not a room info"));
+        };
+        Ok(info.group_id().as_slice().to_vec())
+    }
+
     /// The identity inside a key package, after validating it.
     ///
     /// The **only** honest source for "who sent this invitation": an invitation
