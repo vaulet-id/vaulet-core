@@ -92,19 +92,45 @@ pub struct VerifiedCredential {
     pub exp: i64,
 }
 
-/// [`SoftwareKey`] as `sd-jwt-payload`'s external ES256 signer. `sign` returns
-/// the FULL compact JWS, so the crate only ever receives our own signature and
-/// never touches the private scalar (ADR 0004).
-struct ExternalEs256Signer<'a>(&'a SoftwareKey);
+/// Whatever holds the key that signs a credential.
+///
+/// A trait rather than [`SoftwareKey`] because the key that matters most is the
+/// one nobody can hold: an organisation's key lives in an HSM and is used by
+/// asking it to sign (ADR 0020). Everything above this line is the same either
+/// way — the signature is ES256 over the same bytes, and this crate never sees
+/// a private scalar in either case (ADR 0004).
+/// `Sync` because the SD-JWT builder signs inside an async block that has to be
+/// sendable; a signer reached from several requests must be shareable anyway.
+pub trait Es256Signer: Sync {
+    fn sign_es256(&self, payload: &[u8]) -> Result<Vec<u8>>;
+}
+
+impl Es256Signer for SoftwareKey {
+    fn sign_es256(&self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.sign(payload)
+    }
+}
+
+/// Adapts an [`Es256Signer`] to `sd-jwt-payload`'s external signer. `sign`
+/// returns the FULL compact JWS, so the crate only ever receives a finished
+/// signature.
+struct ExternalEs256Signer<'a>(&'a dyn Es256Signer);
 
 #[async_trait::async_trait]
 impl JwsSigner for ExternalEs256Signer<'_> {
     type Error = String;
-    async fn sign(&self, header: &JsonObject, payload: &JsonObject) -> std::result::Result<Vec<u8>, String> {
+    async fn sign(
+        &self,
+        header: &JsonObject,
+        payload: &JsonObject,
+    ) -> std::result::Result<Vec<u8>, String> {
         let h = B64.encode(serde_json::to_vec(header).map_err(|e| e.to_string())?);
         let p = B64.encode(serde_json::to_vec(payload).map_err(|e| e.to_string())?);
         let signing_input = format!("{h}.{p}");
-        let sig = self.0.sign(signing_input.as_bytes()).map_err(|e| e.to_string())?;
+        let sig = self
+            .0
+            .sign_es256(signing_input.as_bytes())
+            .map_err(|e| e.to_string())?;
         let s = B64.encode(sig);
         Ok(format!("{signing_input}.{s}").into_bytes())
     }
@@ -116,7 +142,7 @@ impl JwsSigner for ExternalEs256Signer<'_> {
 /// Sets `iss`, `vct`, `iat`, `exp` and `cnf.jwk` (holder binding); makes each
 /// `disclosable` claim selectively-disclosable (Z1) and leaves each `visible`
 /// claim in the clear (Z2).
-pub fn issue(params: IssueParams, issuer_key: &SoftwareKey) -> Result<String> {
+pub fn issue(params: IssueParams, issuer_key: &dyn Es256Signer) -> Result<String> {
     let mut claims = Map::new();
     claims.insert("iss".into(), Value::String(params.iss));
     claims.insert("vct".into(), Value::String(params.vct));
@@ -344,7 +370,10 @@ pub fn status_reference(sd_jwt: &str) -> Result<Option<(String, u64)>> {
     let Some(sl) = payload.get("status").and_then(|s| s.get("status_list")) else {
         return Ok(None);
     };
-    match (sl.get("uri").and_then(Value::as_str), sl.get("idx").and_then(Value::as_u64)) {
+    match (
+        sl.get("uri").and_then(Value::as_str),
+        sl.get("idx").and_then(Value::as_u64),
+    ) {
         (Some(uri), Some(idx)) => Ok(Some((uri.to_string(), idx))),
         // Half a reference is not a reference. Treating it as "no status" would
         // quietly accept a credential whose issuer meant it to be revocable.
@@ -485,7 +514,9 @@ pub fn jwk_thumbprint(jwk: &Value) -> Result<String> {
     };
     let kty = member("kty")?;
     if kty != "EC" {
-        return Err(CoreError::Credential("thumbprint supports EC keys only".into()));
+        return Err(CoreError::Credential(
+            "thumbprint supports EC keys only".into(),
+        ));
     }
     let (crv, x, y) = (member("crv")?, member("x")?, member("y")?);
     let canonical = format!(r#"{{"crv":"{crv}","kty":"{kty}","x":"{x}","y":"{y}"}}"#);
@@ -560,8 +591,7 @@ fn decode_jwt_header(sd_jwt: &str) -> Result<Value> {
     let bytes = B64
         .decode(header_b64)
         .map_err(|e| CoreError::Credential(format!("header b64: {e}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| CoreError::Credential(format!("header json: {e}")))
+    serde_json::from_slice(&bytes).map_err(|e| CoreError::Credential(format!("header json: {e}")))
 }
 
 /// Read the `iss` (issuer identifier, a `did:web` in M1) from an SD-JWT payload
@@ -625,8 +655,7 @@ mod status_tests {
         for idx in revoked {
             bytes[(*idx / 8) as usize] |= 1 << (idx % 8);
         }
-        let mut enc =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
         enc.write_all(&bytes).unwrap();
         let lst = B64.encode(enc.finish().unwrap());
 
@@ -842,7 +871,7 @@ mod tests {
         assert_eq!(v.claims["given_name"], json!("Somchai"));
         assert_eq!(v.claims["department"], json!("Engineering"));
         assert!(!v.claims.contains_key("family_name")); // withheld -> absent
-        // Z2 always-visible claim survives selective disclosure.
+                                                        // Z2 always-visible claim survives selective disclosure.
         assert_eq!(v.claims["is_current_employee"], json!(true));
     }
 
@@ -993,20 +1022,29 @@ mod tests {
 
         // Correct pin → accepted.
         assert!(ingest_with_did_document(
-            "c", &sd_jwt, &doc, now, DisplayHints::default(), &[tp.clone()]
+            "c",
+            &sd_jwt,
+            &doc,
+            now,
+            DisplayHints::default(),
+            &[tp.clone()]
         )
         .is_ok());
         // Wrong pin → rejected even though the issuer signature is valid (this is
         // the MITM/rogue-did.json defence).
         assert!(ingest_with_did_document(
-            "c", &sd_jwt, &doc, now, DisplayHints::default(), &["not-the-key".to_string()]
+            "c",
+            &sd_jwt,
+            &doc,
+            now,
+            DisplayHints::default(),
+            &["not-the-key".to_string()]
         )
         .is_err());
         // No pins → allowed (issuer not pinned in the registry).
-        assert!(ingest_with_did_document(
-            "c", &sd_jwt, &doc, now, DisplayHints::default(), &[]
-        )
-        .is_ok());
+        assert!(
+            ingest_with_did_document("c", &sd_jwt, &doc, now, DisplayHints::default(), &[]).is_ok()
+        );
     }
 
     #[test]
