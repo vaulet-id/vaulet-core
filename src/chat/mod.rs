@@ -517,11 +517,14 @@ impl Session {
 
     /// Which room a piece of group info is for, without acting on it.
     ///
-    /// Needed because group info can arrive on a channel that is not the room's
-    /// own — a member who cannot be addressed inside the room has to be reached
-    /// through the conversation that invited them — and a caller must be able
-    /// to check it is a room they are actually in before letting it move their
-    /// state anywhere.
+    /// **Nothing calls this yet, and it is kept deliberately.** Group info can
+    /// arrive on a channel that is not the room's own: the member who cannot be
+    /// addressed inside a room — the case ADR 0022 leaves open — can only be
+    /// reached through the conversation that invited them. Any fix there has to
+    /// check the info names a room we are actually in before letting it move our
+    /// state anywhere, and reading the id without applying it is the piece that
+    /// cannot be done from outside. Two attempts are written up in the ADR; both
+    /// failed for reasons that have nothing to do with this.
     pub fn room_in_group_info(room_info: &[u8]) -> Result<Vec<u8>> {
         let body = MlsMessageIn::tls_deserialize_exact(room_info)
             .map_err(|_| ChatError::Malformed("room info"))?
@@ -753,6 +756,27 @@ mod tests {
 
         assert_eq!(joined, group, "both sides must agree on the group id");
         (alice, bob, group)
+    }
+
+    /// Group info says which room it is for, before anybody acts on it.
+    #[test]
+    fn a_rooms_group_info_names_the_room() {
+        let (alice, _bob, room) = pair();
+        let info = alice.room_info(&room).unwrap();
+
+        assert_eq!(
+            Session::room_in_group_info(&info).unwrap(),
+            room,
+            "the id read without applying it must be the room it came from"
+        );
+
+        // And it refuses anything else rather than guessing.
+        assert!(Session::room_in_group_info(b"not group info at all").is_err());
+        let key_package = Session::new(b"did:peer:carol").unwrap().key_package().unwrap();
+        assert!(
+            Session::room_in_group_info(&key_package).is_err(),
+            "a well-formed MLS message of another kind is not group info"
+        );
     }
 
     /// A room of three, which is the size the rank arithmetic was wrong at.
