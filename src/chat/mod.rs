@@ -586,12 +586,20 @@ impl Session {
     ///
     /// `None` for anything that is not a member's commit — an external sender,
     /// or a message that is not a commit at all. Neither can win a race.
-    pub fn peek_commit(&self, message: &[u8]) -> Option<(u64, u32)> {
+    /// Returns the room, the epoch and the leaf.
+    ///
+    /// **The room matters as much as the other two.** A commit arrives in a
+    /// box, and the box says only which key opens the envelope — every member
+    /// of that room holds it. Ranking on epoch and leaf alone let a commit from
+    /// one room be weighed against a change made in another, and the epochs
+    /// collide often, because every room starts at zero.
+    pub fn peek_commit(&self, message: &[u8]) -> Option<(Vec<u8>, u64, u32)> {
         let message = MlsMessageIn::tls_deserialize_exact(message)
             .ok()?
             .try_into_protocol_message()
             .ok()?;
         let epoch = message.epoch().as_u64();
+        let room = message.group_id().as_slice().to_vec();
         // Only a publicly framed commit can be read from outside its epoch, and
         // that is why rooms are created asking for one. A room made before that
         // — or by another client — frames commits privately, and this says so
@@ -603,7 +611,7 @@ impl Session {
             return None;
         }
         match public.sender() {
-            Sender::Member(leaf) => Some((epoch, leaf.u32())),
+            Sender::Member(leaf) => Some((room, epoch, leaf.u32())),
             _ => None,
         }
     }
@@ -1203,7 +1211,9 @@ mod tests {
 
         // Each ranks the other's commit against its own. Both compute it from
         // the same two numbers, so they must reach opposite conclusions.
-        let (their_epoch, their_leaf) = alice.peek_commit(&from_bob.commit).unwrap();
+        let (their_room, their_epoch, their_leaf) =
+            alice.peek_commit(&from_bob.commit).unwrap();
+        assert_eq!(their_room, room, "a peek must say which room it is for");
         let alice_wins = {
             let mine = Session::restore(&key, &alice_before).unwrap();
             mine.rank(&room, mine.own_leaf(&room).unwrap()).unwrap()
@@ -1211,7 +1221,7 @@ mod tests {
         };
         assert_eq!(their_epoch, 1, "both were built at the epoch they shared");
 
-        let (_, alices_leaf) = bob.peek_commit(&from_alice.commit).unwrap();
+        let (_, _, alices_leaf) = bob.peek_commit(&from_alice.commit).unwrap();
         let bob_wins = {
             let mine = Session::restore(&key, &bob_before).unwrap();
             mine.rank(&room, mine.own_leaf(&room).unwrap()).unwrap()
