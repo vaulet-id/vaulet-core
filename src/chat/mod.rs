@@ -586,6 +586,23 @@ impl Session {
     /// state anywhere, and reading the id without applying it is the piece that
     /// cannot be done from outside. Two attempts are written up in the ADR; both
     /// failed for reasons that have nothing to do with this.
+    /// Which epoch a piece of group info describes.
+    ///
+    /// **The guard on healing.** An external commit is not a repair when we are
+    /// not the broken party: it moves the room for everybody and cannot be
+    /// ranked, so several of them at one epoch fragment the room instead of
+    /// mending it. Rejoining is only ever right when the answer is *ahead* of
+    /// where we are.
+    pub fn epoch_in_group_info(room_info: &[u8]) -> Result<u64> {
+        let body = MlsMessageIn::tls_deserialize_exact(room_info)
+            .map_err(|_| ChatError::Malformed("room info"))?
+            .extract();
+        let MlsMessageBodyIn::GroupInfo(info) = body else {
+            return Err(ChatError::Malformed("not a room info"));
+        };
+        Ok(info.epoch().as_u64())
+    }
+
     pub fn room_in_group_info(room_info: &[u8]) -> Result<Vec<u8>> {
         let body = MlsMessageIn::tls_deserialize_exact(room_info)
             .map_err(|_| ChatError::Malformed("room info"))?
