@@ -776,6 +776,42 @@ impl Session {
             return Err(ChatError::Malformed("not a room info"));
         };
 
+        // **The answer has to come from somebody in the room.**
+        //
+        // A room info is a whole group state, and joining by external commit
+        // builds the group out of the blob's own ratchet tree and checks its
+        // signature against a credential in that same tree — self-consistent by
+        // construction, and therefore no evidence of anything. The blob arrives
+        // in a room inbox, which is HPKE and anonymous: anybody holding the
+        // address may deposit, and everybody who was ever in the room keeps
+        // every address that was announced inside it. So a member who was
+        // removed could answer an ask — or manufacture one — with a group of
+        // their own making, and this device would replace the real room with it
+        // and commit into it, taking the whole room along or leaving it behind.
+        //
+        // What makes an answer evidence is the signature over it belonging to a
+        // member of the group we currently hold. Their leaf index in the
+        // offered tree means nothing to us, so the key is what is checked, not
+        // the position.
+        {
+            let ours = self.load(info.group_id().as_slice())?;
+            let scheme = ours.ciphersuite().signature_algorithm();
+            let crypto = self.provider.crypto();
+            let vouched = ours.members().any(|member| {
+                let key = OpenMlsSignaturePublicKey::new(
+                    member.signature_key.into(),
+                    scheme,
+                );
+                match key {
+                    Ok(key) => info.verify_no_out(crypto, &key).is_ok(),
+                    Err(_) => false,
+                }
+            });
+            if !vouched {
+                return Err(ChatError::Malformed("room info from outside the room"));
+            }
+        }
+
         let (mut group, commit, _) = MlsGroup::join_by_external_commit(
             &self.provider,
             &self.signer,
@@ -1411,6 +1447,55 @@ mod tests {
 
     fn carol_package(mut session: Session) -> Vec<u8> {
         session.key_package().unwrap()
+    }
+
+    /// **A rejoin answer has to come from somebody still in the room.**
+    ///
+    /// The answer is a whole group state, and joining by external commit builds
+    /// the group out of the blob's own ratchet tree and checks its signature
+    /// against a credential in that same tree — self-consistent by
+    /// construction, and so no evidence of anything. The blob travels in a room
+    /// inbox, which is anonymous and open to anybody holding the address, and
+    /// everybody who was ever in a room keeps every address announced inside
+    /// it. So without a check, somebody who had been removed could answer an
+    /// ask with a room of their own making and take the asker into it.
+    #[test]
+    fn a_room_info_from_somebody_no_longer_in_the_room_is_refused() {
+        let (mut alice, mut bob, room) = pair();
+
+        let mut carol = Session::new(b"did:peer:carol").unwrap();
+        let adding = alice
+            .add_member(&room, &carol.key_package().unwrap())
+            .unwrap();
+        bob.receive(&adding.commit).unwrap();
+        carol.join(&adding.welcome).unwrap();
+
+        // Carol is taken out. She never sees it, so she keeps a live group with
+        // this room's id — which is exactly the state an attacker has.
+        let removing = alice.remove_member(&room, b"did:peer:carol").unwrap();
+        bob.receive(&removing).unwrap();
+
+        let hers = carol.room_info(&room).unwrap();
+        assert_eq!(
+            Session::room_in_group_info(&hers).unwrap(),
+            room,
+            "the blob has to name the real room, or this proves nothing"
+        );
+
+        let refused = bob.rejoin(&hers);
+        assert!(
+            refused.is_err(),
+            "a room info signed by somebody the group no longer holds was taken"
+        );
+
+        // And the room bob holds is untouched by the attempt.
+        assert!(
+            bob.members(&room)
+                .unwrap()
+                .iter()
+                .all(|m| m != b"did:peer:carol"),
+            "the refused answer must not have moved this device anywhere"
+        );
     }
 
     /// **A member whose ratchet has fallen behind lets themselves back in**,
