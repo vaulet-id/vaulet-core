@@ -39,6 +39,41 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24; // XChaCha20 nonce
 const KEY_LEN: usize = 32;
 
+/// Seal bytes under a 32-byte key, returning `nonce || ciphertext`.
+///
+/// For things the **server** holds on somebody's behalf for a while — a
+/// companion's presentation waiting for the applicant to finish (ADR 0027).
+/// Not a recovery file: there is no passphrase and no key derivation, because
+/// the key here is one the caller already has and keeps somewhere the ciphertext
+/// is not.
+///
+/// XChaCha20-Poly1305 with a random 24-byte nonce, which is wide enough that
+/// random generation needs no counter and no coordination between processes.
+pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand_core::OsRng.fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let mut out = nonce.to_vec();
+    out.extend(
+        cipher
+            .encrypt(XNonce::from_slice(&nonce), plaintext)
+            .map_err(|_| CoreError::Key("seal failed".into()))?,
+    );
+    Ok(out)
+}
+
+/// Open what [`seal`] produced. Fails on a wrong key or a changed byte —
+/// there is no partial success, which is the point of an AEAD.
+pub fn unseal(key: &[u8; KEY_LEN], sealed: &[u8]) -> Result<Vec<u8>> {
+    if sealed.len() <= NONCE_LEN {
+        return Err(CoreError::Key("sealed value is truncated".into()));
+    }
+    let (nonce, ct) = sealed.split_at(NONCE_LEN);
+    XChaCha20Poly1305::new(key.into())
+        .decrypt(XNonce::from_slice(nonce), ct)
+        .map_err(|_| CoreError::Key("wrong key, or the sealed value was altered".into()))
+}
+
 /// On-disk recovery-file envelope. Everything but the plaintext key.
 #[derive(Serialize, Deserialize)]
 struct Envelope {
@@ -201,6 +236,47 @@ pub fn decrypt_backup(envelope: &str, passphrase: &str) -> Result<String> {
     // Move `pt` into the String (no extra un-wiped copy). The returned secret is
     // the caller's to protect — the bridge holds it in a Zeroizing session.
     String::from_utf8(pt).map_err(|e| CoreError::Key(format!("decrypted backup not utf8: {e}")))
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    /// What was sealed comes back, and nothing else does.
+    #[test]
+    fn a_sealed_value_opens_with_its_key_and_no_other() {
+        let key = [7u8; KEY_LEN];
+        let sealed = seal(&key, b"her passport, waiting for him").unwrap();
+        assert_eq!(unseal(&key, &sealed).unwrap(), b"her passport, waiting for him");
+
+        let mut other = key;
+        other[0] ^= 1;
+        assert!(unseal(&other, &sealed).is_err());
+    }
+
+    /// **One byte changed is a failure, not a slightly different answer.** A
+    /// caller that got plaintext back from a tampered record would act on it.
+    #[test]
+    fn a_changed_byte_fails_rather_than_decoding() {
+        let key = [3u8; KEY_LEN];
+        let sealed = seal(&key, b"approval").unwrap();
+        for i in [0, NONCE_LEN, sealed.len() - 1] {
+            let mut broken = sealed.clone();
+            broken[i] ^= 1;
+            assert!(unseal(&key, &broken).is_err(), "byte {i} went unnoticed");
+        }
+        assert!(unseal(&key, &sealed[..NONCE_LEN]).is_err());
+        assert!(unseal(&key, b"").is_err());
+    }
+
+    /// Sealing the same bytes twice must not produce the same record, or two
+    /// identical waiting contributions would be visible as identical to anybody
+    /// reading the table.
+    #[test]
+    fn the_same_plaintext_seals_differently_each_time() {
+        let key = [11u8; KEY_LEN];
+        assert_ne!(seal(&key, b"same").unwrap(), seal(&key, b"same").unwrap());
+    }
 }
 
 #[cfg(test)]
