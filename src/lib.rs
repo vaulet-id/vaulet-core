@@ -490,6 +490,72 @@ pub fn wallet_present(
     credential::present(sd_jwt, disclose, audience, nonce, &key, iat)
 }
 
+/// Read what somebody is being asked to sign, without signing it (ADR 0029).
+///
+/// **Rendered from the bytes that will be signed**, not from a catalogue the
+/// app fetched separately — the template arrives inside the ask and its hash
+/// goes inside the signature, so what a person reads on the consent screen is
+/// what they put their name to. A wallet that rendered from anywhere else would
+/// be showing a sentence nobody signed.
+pub fn wallet_read_statement_ask(ask_json: &str, lang: &str) -> Result<String> {
+    let ask: protocol::oid4vp::StatementAsk = serde_json::from_str(ask_json)
+        .map_err(|e| CoreError::Protocol(format!("statement ask: {e}")))?;
+    let act = statement::Act::parse(&ask.act)
+        .ok_or_else(|| CoreError::Protocol(format!("unknown act {}", ask.act)))?;
+    // Through `seal`, so the consent screen refuses exactly what the issuer
+    // would refuse — a missing value, a term on an act that takes none — rather
+    // than showing a sentence with a hole in it and failing at the far end.
+    statement::Statement {
+        act,
+        subject: ask.subject,
+        fields: ask.fields,
+        template: ask.template,
+        lang: lang.to_string(),
+    }
+    .seal()
+    .map(|signed| signed.text)
+}
+
+/// Sign what was asked, with the holder's own key.
+///
+/// `holder_jwk` is whoever will hold the statement — the party it was made out
+/// to. The signer is this wallet, and the two are different by design: a
+/// statement about somebody else is held by that somebody else.
+#[allow(clippy::too_many_arguments)]
+pub fn wallet_sign_statement(
+    secret: &str,
+    ask_json: &str,
+    lang: &str,
+    vct: &str,
+    holder_jwk: &str,
+    iat: i64,
+    exp: i64,
+) -> Result<String> {
+    let ask: protocol::oid4vp::StatementAsk = serde_json::from_str(ask_json)
+        .map_err(|e| CoreError::Protocol(format!("statement ask: {e}")))?;
+    let act = statement::Act::parse(&ask.act)
+        .ok_or_else(|| CoreError::Protocol(format!("unknown act {}", ask.act)))?;
+    let key = load_secret_key(secret)?;
+    let signer_did = did::did_jwk_from_public(&key.public_jwk()?)?;
+    let holder: serde_json::Value = serde_json::from_str(holder_jwk)
+        .map_err(|e| CoreError::Protocol(format!("holder jwk: {e}")))?;
+    statement::issue_statement(
+        statement::Statement {
+            act,
+            subject: ask.subject,
+            fields: ask.fields,
+            template: ask.template,
+            lang: lang.to_string(),
+        },
+        vct,
+        &signer_did,
+        holder,
+        iat,
+        exp,
+    &key,
+    )
+}
+
 /// Ingest a received credential-response SD-JWT into a [`credential::StoredCredential`]:
 /// verify it against the issuer's `did:web` document (Dart fetched the doc, so
 /// this stays network-free) and cache its display. `issuer_did_doc` is the raw
