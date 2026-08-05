@@ -834,6 +834,30 @@ pub mod oid4vp {
         /// they hand over a passport.
         #[serde(default)]
         pub issues: bool,
+        /// A statement this role is asked to sign (ADR 0029) — a guarantee, an
+        /// approval, an authority. Absent on a role that only presents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub statement: Option<StatementAsk>,
+    }
+
+    /// What a role is being asked to put their name to.
+    ///
+    /// **Everything the sentence needs is fixed by the request**, so the wallet
+    /// renders exactly what will be signed and the person reads the whole of it
+    /// before agreeing. A field left for the signer to fill would be a sentence
+    /// they compose about themselves, which is the one thing a statement is
+    /// not.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct StatementAsk {
+        /// `guarantee`, `approve`, `authorise` — from Vaulet's catalogue.
+        pub act: String,
+        /// What the statement is about, opaque to everyone but the two ends.
+        pub subject: String,
+        /// The values the request fixed: how much, how long, what about.
+        pub fields: std::collections::BTreeMap<String, String>,
+        /// The wording, carried so the wallet renders from what it will sign
+        /// rather than from a catalogue it fetched separately.
+        pub template: crate::statement::Template,
     }
 
     impl PresentationRequest {
@@ -880,6 +904,10 @@ pub mod oid4vp {
         /// every request with one role.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub session: Option<String>,
+        /// The statement this role signed, as a credential they issued
+        /// (ADR 0029). Present exactly when the role was asked for one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub statement: Option<String>,
     }
 
     /// The payload of a signed form submission.
