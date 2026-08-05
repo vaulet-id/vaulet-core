@@ -88,6 +88,11 @@ pub enum ChatError {
     NotForUs,
     #[error("invitation is version {0}, which this build cannot read")]
     UnsupportedInvitationVersion(u8),
+    /// The answer describes the room we are already in, or one older. Every
+    /// member answers an anonymous ask, so this is the ordinary outcome rather
+    /// than a failure — see `rejoin`.
+    #[error("that room info is not ahead of us")]
+    NotAhead,
 }
 
 pub type Result<T> = std::result::Result<T, ChatError>;
@@ -797,18 +802,56 @@ impl Session {
             let ours = self.load(info.group_id().as_slice())?;
             let scheme = ours.ciphersuite().signature_algorithm();
             let crypto = self.provider.crypto();
-            let vouched = ours.members().any(|member| {
+            let vouched = ours.members().find_map(|member| {
                 let key = OpenMlsSignaturePublicKey::new(
                     member.signature_key.into(),
                     scheme,
-                );
-                match key {
-                    Ok(key) => info.verify_no_out(crypto, &key).is_ok(),
-                    Err(_) => false,
-                }
+                )
+                .ok()?;
+                info.clone().verify(crypto, &key).ok()
             });
-            if !vouched {
+            let Some(vouched) = vouched else {
                 return Err(ChatError::Malformed("room info from outside the room"));
+            };
+
+            // **Ahead of us, or beside us — but never the room we are already
+            // in.**
+            //
+            // An external commit moves the whole room, and it cannot be ranked,
+            // so several at one epoch fragment the room rather than mend it.
+            // The rule was therefore "only when the answer is ahead", and an
+            // ask is answered by every member at *their* epoch — which is right
+            // for the healthy majority and exactly inverted for the one member
+            // that is broken. A ratchet that disagrees inside one epoch is the
+            // case this machinery exists for, and every answer to it carries
+            // the same epoch number, so every answer was refused and the room
+            // stayed split for good: both sides shown lost messages, neither
+            // shown anything wrong, and nothing but somebody joining or leaving
+            // could ever have unstuck it.
+            //
+            // The epoch alone cannot tell the two apart. The transcript hash
+            // can: two devices on the same branch of the same epoch agree on
+            // it, and two devices on different branches do not.
+            let theirs = vouched.group_context();
+            // **The tree is what tells the two apart.** Two devices on the same
+            // branch of an epoch hold the same ratchet tree; two devices on
+            // different branches of it do not, because each applied a different
+            // commit. The group context itself is not readable from outside the
+            // library, and the epoch number alone says nothing here.
+            let mine = ours
+                .export_ratchet_tree()
+                .tls_serialize_detached()
+                .map_err(mls)?;
+            let same_branch = vouched.extensions().ratchet_tree().is_some_and(
+                |tree| {
+                    tree.ratchet_tree()
+                        .tls_serialize_detached()
+                        .is_ok_and(|theirs| theirs == mine)
+                },
+            );
+            let behind = theirs.epoch().as_u64() < ours.epoch().as_u64();
+            if same_branch || behind {
+                return Err(ChatError::NotAhead);
             }
         }
 
@@ -1447,6 +1490,66 @@ mod tests {
 
     fn carol_package(mut session: Session) -> Vec<u8> {
         session.key_package().unwrap()
+    }
+
+    /// **A room split inside one epoch can be rejoined.**
+    ///
+    /// The rule was "only when the answer is ahead of us", which is right for
+    /// the healthy majority — an ask is anonymous, so everybody answers, and
+    /// most answers describe the epoch the asker is already at. It is exactly
+    /// inverted for the one member whose ratchet disagrees *inside* an epoch:
+    /// every answer to that member carries the same epoch number, so every
+    /// answer was refused and the room stayed split for good, with both sides
+    /// shown lost messages and neither shown anything wrong.
+    #[test]
+    fn a_room_split_inside_one_epoch_can_be_rejoined() {
+        let (mut alice, mut bob, room) = pair();
+
+        // Two commits at the same epoch. Each applies their own and never sees
+        // the other's, which is the fork.
+        let carol = Session::new(b"did:peer:carol").unwrap();
+        let dave = Session::new(b"did:peer:dave").unwrap();
+        alice
+            .add_member(&room, &carol_package(carol))
+            .unwrap();
+        bob.add_member(&room, &carol_package(dave)).unwrap();
+        assert_eq!(
+            alice.epoch(&room).unwrap(),
+            bob.epoch(&room).unwrap(),
+            "the split has to be inside one epoch, or this proves nothing"
+        );
+
+        let wire = alice.send(&room, b"can you hear me").unwrap();
+        assert!(
+            matches!(bob.receive(&wire).unwrap(), Received::Undecryptable { .. }),
+            "the break has to be real"
+        );
+
+        // Alice answers Bob's ask with a room info at the epoch he is already
+        // at — the only kind of answer this case can produce.
+        let info = alice.room_info(&room).unwrap();
+        let back = bob.rejoin(&info).expect("the one answer that could heal it");
+        alice.receive(&back.commit).unwrap();
+
+        let after = alice.send(&room, b"there you are").unwrap();
+        match bob.receive(&after).unwrap() {
+            Received::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"there you are");
+            }
+            other => panic!("the room is still split: {other:?}"),
+        }
+    }
+
+    /// And the answer that describes the room we are already in is still
+    /// refused, which is what stops an anonymous ask fragmenting the room.
+    #[test]
+    fn a_room_info_for_the_room_we_are_in_is_refused() {
+        let (alice, mut bob, room) = pair();
+        let info = alice.room_info(&room).unwrap();
+        assert!(
+            matches!(bob.rejoin(&info), Err(ChatError::NotAhead)),
+            "a healthy member acted on an answer describing its own room"
+        );
     }
 
     /// **A rejoin answer has to come from somebody still in the room.**
