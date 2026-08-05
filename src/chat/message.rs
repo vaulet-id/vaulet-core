@@ -98,6 +98,25 @@ pub const ROOM_ADDRESS: &str = "https://vaulet.id/chat/1.0/room-address";
 /// the room; that one never leaves their device.
 pub const ROOM_NAME: &str = "https://vaulet.id/chat/1.0/room-name";
 
+/// "I am applying for something that needs you too" (ADR 0027).
+///
+/// A request with more than one role — a family travel credential, a guarantee
+/// letter — is answered by several people, and this is one of them being asked.
+/// The body names the request, the role, and the attempt to join; nothing
+/// secret is in it, because what it grants is the chance to *contribute*, not to
+/// read anything.
+///
+/// **Sent in the room rather than as a link, wherever there is a room.** The
+/// message is *"send me your passport"*, which is the exact shape of the fraud
+/// running in Thailand every day — and MLS states who sent it, so the receiver
+/// is told who is asking by the protocol rather than by a claim in the body. A
+/// link carries no sender identity at all, which is why it is the fallback and
+/// why the wallet has to say so when it opens one.
+///
+/// The issuer never sees this. The wallets do the inviting; the issuer only
+/// ever sees presentations arrive, each naming which role it answers.
+pub const REQUEST_INVITE: &str = "https://vaulet.id/requests/1.0/invitation";
+
 /// Most a sender will repeat in answer to one request.
 ///
 /// A bound rather than a judgement about conversations: the request names a
