@@ -38,6 +38,9 @@ const INBOX_KEY_INFO: &[u8] = b"vaulet/chat/inbox/v1";
 /// owns in one request instead of one per contact.
 const GROUP_KEY_INFO: &[u8] = b"vaulet/chat/group/v1";
 
+/// One address for this person, rather than one per contact (ADR 0028).
+const ACCOUNT_KEY_INFO: &[u8] = b"vaulet/chat/account/v1";
+
 /// The key for **this device's inbox in one room** (ADR 0022).
 ///
 /// A per-contact inbox cannot address a room: in a room of A, B and C, B must
@@ -134,6 +137,48 @@ pub fn public_key(seed: &[u8], index: u32) -> Result<Vec<u8>> {
         .to_vec())
 }
 
+/// One box for everybody, rather than one per contact (ADR 0028).
+///
+/// **What the per-contact box bought and what it cost.** A separate address for
+/// every contact means the mediator never learns that two of them are the same
+/// person, and blocking is destroying one address rather than asking a server
+/// to enforce a rule. The cost was the machinery that had to exist to make many
+/// boxes behave as one: a device group to collect them in a single request, a
+/// join for each box, a sweep to repair the joins, and a flag per box for what
+/// had reached disk. Audit rounds found silent message loss in every one of
+/// those.
+///
+/// So there is now an address that is simply this person's, derived from the
+/// seed and nothing else. It hides nothing about who is talking to whom, which
+/// is the trade 0028 records, and it needs none of the machinery above.
+///
+/// Its own label, so it cannot be worked back to any per-contact box and the
+/// two kinds can be used side by side while contacts move over.
+fn derive_account(seed: &[u8]) -> Result<SigningKey> {
+    let mut scalar = [0u8; 32];
+    Hkdf::<Sha256>::new(None, seed)
+        .expand(ACCOUNT_KEY_INFO, &mut scalar)
+        .map_err(|_| ChatError::Mls("account key derivation".into()))?;
+    SigningKey::from_slice(&scalar)
+        .map_err(|_| ChatError::Mls("account scalar out of range".into()))
+}
+
+/// The public half of the account key, SEC1-uncompressed. Its hash is the
+/// address, exactly as an inbox's is.
+pub fn account_public_key(seed: &[u8]) -> Result<Vec<u8>> {
+    Ok(derive_account(seed)?
+        .verifying_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec())
+}
+
+/// Prove the account box is ours, to collect from it or delete it.
+pub fn sign_account_challenge(seed: &[u8], challenge: &[u8]) -> Result<Vec<u8>> {
+    let signature: Signature = derive_account(seed)?.sign(challenge);
+    Ok(signature.to_der().as_bytes().to_vec())
+}
+
 /// Derive the key that names this device's group of inboxes (ADR 0017).
 ///
 /// Its own label, so the group id cannot be worked back to any inbox and a
@@ -183,6 +228,44 @@ mod tests {
     use p256::ecdsa::{signature::Verifier, VerifyingKey};
 
     const SEED: &[u8] = b"a wallet seed, sixty four bytes in real life but any length here";
+
+    /// The account box is this person's and nobody else's, and it is not any of
+    /// the other keys the same seed produces.
+    #[test]
+    fn an_account_box_is_its_own_address() {
+        let mine = account_public_key(SEED).unwrap();
+        let theirs = account_public_key(b"somebody else entirely").unwrap();
+        assert_ne!(mine, theirs, "two people share an address");
+
+        // Same seed, same address, every time — it is what a card carries.
+        assert_eq!(mine, account_public_key(SEED).unwrap());
+
+        // And it is reachable from none of the others: a leaked account key
+        // must not authorise emptying a contact box, and the two kinds are in
+        // use side by side while contacts move over.
+        assert_ne!(mine, group_public_key(SEED).unwrap());
+        for index in 0..4 {
+            assert_ne!(
+                mine,
+                public_key(SEED, index).unwrap(),
+                "the account box collides with contact box {index}"
+            );
+        }
+    }
+
+    /// Possession is provable, which is what a collection asks for.
+    #[test]
+    fn an_account_box_can_prove_it_is_ours() {
+        let signature = sign_account_challenge(SEED, b"a nonce").unwrap();
+        let key = VerifyingKey::from_sec1_bytes(&account_public_key(SEED).unwrap()).unwrap();
+        let parsed = Signature::from_der(&signature).unwrap();
+        assert!(key.verify(b"a nonce", &parsed).is_ok());
+
+        // Somebody else's signature does not stand in for ours.
+        let theirs = sign_account_challenge(b"somebody else entirely", b"a nonce").unwrap();
+        let parsed = Signature::from_der(&theirs).unwrap();
+        assert!(key.verify(b"a nonce", &parsed).is_err());
+    }
 
     #[test]
     fn each_contact_gets_a_different_inbox() {
