@@ -113,6 +113,11 @@ impl Act {
         }
     }
 
+    /// Whether this act is undone by naming an earlier statement.
+    pub fn names_another(self) -> bool {
+        matches!(self, Act::Rescind | Act::Withdraw)
+    }
+
     /// The fields the symbol must carry, beyond `until` which [`Term`] governs.
     ///
     /// Named here rather than left to the template, so a symbol that renders
@@ -280,6 +285,26 @@ impl Statement {
                 )));
             }
         }
+        // **One representation of the term, and it is the machine's.**
+        //
+        // A displayed date beside a timestamp would be two spellings of one
+        // fact — the exact pair this whole design exists to refuse — so the
+        // sentence renders whatever is in the field, verbatim, and the field is
+        // a date anybody can compare. A sentence reading "ถึงวันที่ 2031-09-05"
+        // is less graceful than one reading "5 กันยายน 2574"; a localised date
+        // is a new template version, which is the mechanism already here for
+        // changing wording, and not a change to the renderer.
+        //
+        // Changing how rendering works is the one thing that cannot be done
+        // later: every statement already signed would re-render differently and
+        // be void. The renderer substitutes and nothing else, for ever.
+        if let Some(until) = self.fields.get("until") {
+            if !is_iso_date(until) {
+                return Err(CoreError::Protocol(format!(
+                    "until has to be a YYYY-MM-DD date, not {until}"
+                )));
+            }
+        }
         let text = self.template.render(&self.lang, &self.fields)?;
         Ok(SignedStatement {
             act: self.act.as_str().to_string(),
@@ -321,6 +346,115 @@ pub fn open(signed: &SignedStatement) -> Result<Act> {
     Ok(act)
 }
 
+/// `YYYY-MM-DD`, checked by shape rather than parsed into a calendar.
+///
+/// The comparison this enables is string order, which for this format is date
+/// order — so nothing here needs a date library, and a value that would need
+/// one has already been refused.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                true
+            } else {
+                c.is_ascii_digit()
+            }
+        })
+}
+
+/// Sign a statement with the signer's own key, as a credential they issue.
+///
+/// `exp` is about the ARTEFACT and `until` is about the ACT, and they are not
+/// the same thing: one says how long this document is treated as current, the
+/// other says how long the person is bound. A credential that expires while the
+/// guarantee it carries is still owed would be a statement nobody can verify
+/// and everybody is still bound by, so that combination is refused here.
+pub fn issue_statement(
+    statement: Statement,
+    vct: &str,
+    signer_did: &str,
+    holder_jwk: serde_json::Value,
+    iat: i64,
+    exp: i64,
+    key: &dyn crate::credential::Es256Signer,
+) -> Result<String> {
+    let signed = statement.seal()?;
+    if let Some(until) = signed.fields.get("until") {
+        // Both are dates in the same order-comparable shape once `exp` is
+        // rendered as one; comparing the day is enough, and a statement that
+        // expires on the day it stops binding is fine.
+        let expires_on = crate::statement::iso_day(exp);
+        if expires_on.as_str() < until.as_str() {
+            return Err(CoreError::Protocol(format!(
+                "this would stop verifying on {expires_on} while it still binds until {until}"
+            )));
+        }
+    }
+    let visible = serde_json::to_value(&signed)
+        .map_err(|e| CoreError::Protocol(format!("statement: {e}")))?;
+    let visible = match visible {
+        serde_json::Value::Object(map) => map,
+        _ => return Err(CoreError::Protocol("statement is not an object".into())),
+    };
+    crate::credential::issue(
+        crate::credential::IssueParams {
+            vct: vct.to_string(),
+            iss: signer_did.to_string(),
+            iat,
+            exp,
+            holder_jwk,
+            // Nothing selectively disclosable. A statement whose act or amount
+            // could be withheld is one a verifier cannot read, and the point of
+            // it is being read by somebody who was not there.
+            disclosable: serde_json::Map::new(),
+            visible,
+        },
+        key,
+    )
+}
+
+/// The day a Unix timestamp falls on, as `YYYY-MM-DD` (UTC).
+///
+/// Civil-from-days, which is exact and needs no calendar crate — the same
+/// arithmetic every date library performs, written out because pulling in a
+/// dependency to format one date is not worth the supply chain.
+fn iso_day(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    // Howard Hinnant's civil_from_days, shifted to an era starting 0000-03-01.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Read a statement out of a credential somebody signed, and refuse it if the
+/// symbol and the sentence disagree.
+///
+/// Both checks, in the order a reader would want them: the signature first,
+/// because an unsigned statement is not a statement, then the void rule.
+pub fn verify_statement(
+    sd_jwt: &str,
+    signer_jwk: &serde_json::Value,
+    now: i64,
+) -> Result<(Act, SignedStatement)> {
+    let verified = crate::credential::verify(sd_jwt, signer_jwk, now)?;
+    let signed: SignedStatement =
+        serde_json::from_value(serde_json::Value::Object(verified.claims))
+            .map_err(|e| CoreError::Protocol(format!("not a statement: {e}")))?;
+    let act = open(&signed)?;
+    Ok((act, signed))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,7 +485,7 @@ mod tests {
             fields: BTreeMap::from([
                 ("cap".to_string(), "500,000".to_string()),
                 ("ccy".to_string(), "THB".to_string()),
-                ("until".to_string(), "5 กันยายน 2574".to_string()),
+                ("until".to_string(), "2031-09-05".to_string()),
             ]),
             template: guarantee_template(),
             lang: "th".into(),
@@ -366,7 +500,7 @@ mod tests {
         let signed = guarantee().seal().unwrap();
         assert_eq!(
             signed.text,
-            "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 THB ถึงวันที่ 5 กันยายน 2574"
+            "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 THB ถึงวันที่ 2031-09-05"
         );
     }
 
@@ -491,6 +625,96 @@ mod tests {
         assert_ne!(a, other.hash().unwrap());
     }
 
+    /// A term has one representation and it is the machine's. A displayed date
+    /// beside a timestamp would be two spellings of one fact, which is the pair
+    /// this whole design refuses.
+    #[test]
+    fn a_term_that_cannot_be_compared_is_refused() {
+        let mut s = guarantee();
+        s.fields
+            .insert("until".to_string(), "5 กันยายน 2574".to_string());
+        assert!(s.seal().is_err());
+    }
+
+    fn key() -> crate::keys::software::SoftwareKey {
+        crate::keys::software::SoftwareKey::generate()
+    }
+
+    /// Signed by the person, verified by anybody, and the sentence still has to
+    /// follow from the symbol at the far end.
+    #[test]
+    fn a_signed_statement_round_trips() {
+        let k = key();
+        let jwk = k.public_jwk().unwrap();
+        let sd_jwt = issue_statement(
+            guarantee(),
+            "https://vaulet.id/credential/statement",
+            "did:jwk:signer",
+            jwk.clone(),
+            1_700_000_000,
+            2_000_000_000,
+            &k,
+        )
+        .unwrap();
+
+        let (act, signed) = verify_statement(&sd_jwt, &jwk, 1_700_000_100).unwrap();
+        assert_eq!(act, Act::Guarantee);
+        assert_eq!(signed.subject, "loan-9021");
+        assert_eq!(
+            signed.text,
+            "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 THB ถึงวันที่ 2031-09-05"
+        );
+    }
+
+    /// **A credential that dies while the guarantee is still owed** would be a
+    /// statement nobody can verify and everybody is still bound by. `exp` is
+    /// about the artefact and `until` is about the act, and this is the one
+    /// place they have to be looked at together.
+    #[test]
+    fn a_statement_cannot_expire_before_it_stops_binding() {
+        let k = key();
+        let too_soon = issue_statement(
+            guarantee(),
+            "https://vaulet.id/credential/statement",
+            "did:jwk:signer",
+            k.public_jwk().unwrap(),
+            1_700_000_000,
+            // 2026, while the guarantee runs to 2031.
+            1_760_000_000,
+            &k,
+        );
+        assert!(too_soon.is_err(), "{too_soon:?}");
+    }
+
+    /// The arithmetic behind that comparison, pinned against dates worked out
+    /// by hand — a leap day, a century boundary, and the epoch.
+    #[test]
+    fn the_day_a_timestamp_falls_on() {
+        assert_eq!(iso_day(0), "1970-01-01");
+        assert_eq!(iso_day(1_709_164_800), "2024-02-29");
+        assert_eq!(iso_day(4_102_444_800), "2100-01-01");
+        assert_eq!(iso_day(1_760_000_000), "2025-10-09");
+    }
+
+    /// Nothing in a statement is selectively disclosable. A verifier who
+    /// receives one is somebody who was not there, and an amount that could be
+    /// withheld is a statement they cannot read.
+    #[test]
+    fn every_part_of_a_statement_is_visible() {
+        let k = key();
+        let sd_jwt = issue_statement(
+            guarantee(),
+            "https://vaulet.id/credential/statement",
+            "did:jwk:signer",
+            k.public_jwk().unwrap(),
+            1_700_000_000,
+            2_000_000_000,
+            &k,
+        )
+        .unwrap();
+        assert!(!sd_jwt.trim_end_matches('~').contains('~'), "no disclosures");
+    }
+
     /// Reading in Thai and reading in English are two different acts of
     /// reading, and the statement records which one happened.
     #[test]
@@ -498,7 +722,7 @@ mod tests {
         let mut english = guarantee();
         english.lang = "en".into();
         let signed = english.seal().unwrap();
-        assert_eq!(signed.text, "I guarantee up to 500,000 THB until 5 กันยายน 2574");
+        assert_eq!(signed.text, "I guarantee up to 500,000 THB until 2031-09-05");
         assert_eq!(signed.lang, "en");
     }
 }
