@@ -66,13 +66,27 @@ pub enum Term {
 }
 
 /// How a statement stops being in force.
+///
+/// Three ways, because a statement is three different kinds of thing depending
+/// on the act — and the first draft of this had only two, which put a guarantee
+/// and an authority together and made both need a register nobody would read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Undo {
-    /// Still doing something, so it can be stopped: a status entry, on the
-    /// register of whoever the statement was made out to.
+    /// **It is evidence attached to something else**, so undoing it is
+    /// revoking the thing. A guarantee backs a letter; the letter is a
+    /// credential and already carries a status entry, and revoking the letter
+    /// ends the guarantee with it.
+    ///
+    /// Nothing new is built for this, which is the point. A status entry of its
+    /// own would be a second list, kept by the party who also holds the letter
+    /// and their own records of it — nobody would ever read it.
+    WithTheCredential,
+    /// **It is the thing itself**, so it needs its own switch. An authority
+    /// permits something right now and "stop my agent" is not answerable by an
+    /// expiry, and there is no credential behind it to revoke instead.
     StatusList,
-    /// Finished the moment it was made. Undone by a further statement, which
-    /// keeps the history a flipped bit would erase.
+    /// **It is finished**, so there is nothing to stop. Undone by a further
+    /// statement, which keeps the history a flipped bit would erase.
     Counterstatement,
 }
 
@@ -108,7 +122,8 @@ impl Act {
 
     pub fn undo(self) -> Undo {
         match self {
-            Act::Guarantee | Act::Authorise => Undo::StatusList,
+            Act::Guarantee => Undo::WithTheCredential,
+            Act::Authorise => Undo::StatusList,
             Act::Approve | Act::Rescind | Act::Withdraw => Undo::Counterstatement,
         }
     }
@@ -644,9 +659,15 @@ mod tests {
     /// a record that says a decision never happened and one that says when it
     /// was undone.
     #[test]
-    fn what_is_still_running_is_stopped_and_what_is_done_is_answered() {
-        assert_eq!(Act::Guarantee.undo(), Undo::StatusList);
+    fn each_act_is_undone_the_way_its_own_shape_allows() {
+        // Evidence: revoke the letter it backs. The letter is a credential and
+        // already has a status entry, so there is nothing to build — and a
+        // second list would be kept by the same party who holds the letter,
+        // which nobody would read.
+        assert_eq!(Act::Guarantee.undo(), Undo::WithTheCredential);
+        // The thing itself: no credential behind it to revoke instead.
         assert_eq!(Act::Authorise.undo(), Undo::StatusList);
+        // Already happened: a flipped bit would say it never did.
         assert_eq!(Act::Approve.undo(), Undo::Counterstatement);
         assert_eq!(Act::Rescind.undo(), Undo::Counterstatement);
     }
