@@ -125,10 +125,20 @@ impl Act {
     /// by somebody at midnight.
     pub fn required_fields(self) -> &'static [&'static str] {
         match self {
-            Act::Approve => &[],
-            Act::Guarantee => &["cap", "ccy"],
-            Act::Authorise => &["scope", "limit"],
-            Act::Rescind | Act::Withdraw => &[],
+            // `about` is in every sentence, because every one of these needs to
+            // say what it is about and `subject` is an opaque id — "I guarantee
+            // loan-9021" is not a sentence anybody can consent to.
+            //
+            // It is supplied by whoever asks for the statement, and that is not
+            // the same as letting them write the wording: they name the thing,
+            // we own the frame around it. A value is not a sentence.
+            // `role` because an approval that does not say in what capacity it
+            // was given is not evidence of anything — a manager approving leave
+            // and a colleague saying "fine by me" would read identically.
+            Act::Approve => &["about", "role"],
+            Act::Guarantee => &["about", "cap", "ccy"],
+            Act::Authorise => &["about", "scope", "limit"],
+            Act::Rescind | Act::Withdraw => &["about"],
         }
     }
 }
@@ -468,11 +478,12 @@ mod tests {
             wording: BTreeMap::from([
                 (
                     "th".to_string(),
-                    "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน {cap} {ccy} ถึงวันที่ {until}".to_string(),
+                    "ข้าพเจ้าค้ำประกัน {about} ในวงเงินไม่เกิน {cap} {ccy} ถึงวันที่ {until}"
+                        .to_string(),
                 ),
                 (
                     "en".to_string(),
-                    "I guarantee up to {cap} {ccy} until {until}".to_string(),
+                    "I guarantee {about} up to {cap} {ccy} until {until}".to_string(),
                 ),
             ]),
         }
@@ -483,6 +494,7 @@ mod tests {
             act: Act::Guarantee,
             subject: "loan-9021".into(),
             fields: BTreeMap::from([
+                ("about".to_string(), "สัญญาเงินกู้เลขที่ 9021".to_string()),
                 ("cap".to_string(), "500,000".to_string()),
                 ("ccy".to_string(), "THB".to_string()),
                 ("until".to_string(), "2031-09-05".to_string()),
@@ -500,7 +512,7 @@ mod tests {
         let signed = guarantee().seal().unwrap();
         assert_eq!(
             signed.text,
-            "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 THB ถึงวันที่ 2031-09-05"
+            "ข้าพเจ้าค้ำประกัน สัญญาเงินกู้เลขที่ 9021 ในวงเงินไม่เกิน 500,000 THB ถึงวันที่ 2031-09-05"
         );
     }
 
@@ -550,11 +562,14 @@ mod tests {
         let mut s = Statement {
             act: Act::Approve,
             subject: "leave-441".into(),
-            fields: BTreeMap::from([("role".to_string(), "manager".to_string())]),
+            fields: BTreeMap::from([
+                ("role".to_string(), "manager".to_string()),
+                ("about".to_string(), "การลาพักร้อน 5-9 กันยายน".to_string()),
+            ]),
             template: Template {
                 act: "approve".into(),
                 version: 1,
-                wording: BTreeMap::from([("th".to_string(), "อนุมัติโดย {role}".to_string())]),
+                wording: BTreeMap::from([("th".to_string(), "อนุมัติ {about} โดย {role}".to_string())]),
             },
             lang: "th".into(),
         };
@@ -597,7 +612,7 @@ mod tests {
         let mut s = guarantee();
         s.template
             .wording
-            .insert("th".to_string(), "ค้ำ {cap} {ccy} ถึง {until} เงื่อนไข {extra}".to_string());
+            .insert("th".to_string(), "ค้ำ {about} {cap} {ccy} ถึง {until} เงื่อนไข {extra}".to_string());
         assert!(s.seal().is_err());
     }
 
@@ -662,7 +677,7 @@ mod tests {
         assert_eq!(signed.subject, "loan-9021");
         assert_eq!(
             signed.text,
-            "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 THB ถึงวันที่ 2031-09-05"
+            "ข้าพเจ้าค้ำประกัน สัญญาเงินกู้เลขที่ 9021 ในวงเงินไม่เกิน 500,000 THB ถึงวันที่ 2031-09-05"
         );
     }
 
@@ -722,7 +737,10 @@ mod tests {
         let mut english = guarantee();
         english.lang = "en".into();
         let signed = english.seal().unwrap();
-        assert_eq!(signed.text, "I guarantee up to 500,000 THB until 2031-09-05");
+        assert_eq!(
+            signed.text,
+            "I guarantee สัญญาเงินกู้เลขที่ 9021 up to 500,000 THB until 2031-09-05"
+        );
         assert_eq!(signed.lang, "en");
     }
 }
