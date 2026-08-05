@@ -14,6 +14,7 @@ pub mod mnemonic;
 pub mod protocol;
 pub mod recovery;
 pub mod requests;
+pub mod statement;
 pub mod shamir;
 
 use thiserror::Error;

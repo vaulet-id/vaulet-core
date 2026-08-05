@@ -1,0 +1,504 @@
+//! Signing a statement about something other than yourself (ADR 0029).
+//!
+//! A guarantor backing an application, a director approving a resolution,
+//! somebody authorising an agent to act for them. One primitive, because they
+//! are one act: **a person putting their key behind a claim about the world**,
+//! rather than behind a claim about themselves.
+//!
+//! Two representations of that claim travel together and they are not copies:
+//!
+//! ```text
+//!   symbol   {"act":"guarantee","cap":"500000","ccy":"THB", …}
+//!   text     "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 บาท"
+//! ```
+//!
+//! The **symbol is for the app**: it decides what is rendered, what a rule can
+//! check, what an agent is permitted to do. The **text is what binds the
+//! person**, because it is what they read — nobody signs JSON, and no court
+//! reads it.
+//!
+//! **Where the two disagree the statement is void.** Not "text wins", which
+//! makes our rendering bug into somebody's real debt; not "symbol wins", which
+//! tells a person that what they read is not what they agreed to. Refused, on
+//! the day it happens, by anybody who verifies — see [`open`].
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+use crate::{CoreError, Result};
+
+/// The verb of a statement, and the shape it forces.
+///
+/// **Vaulet defines these; a request that uses one fills in its values.** Not a
+/// free string: a statement nobody can parse is a statement no rule can be
+/// applied to, and an act invented at a keyboard has no reviewed sentence to
+/// render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Act {
+    /// A decision that has been taken. Leave approved, resolution passed.
+    Approve,
+    /// Standing behind somebody else's obligation, for a stated term.
+    Guarantee,
+    /// Permission for somebody — or something — to act, within a scope and
+    /// until a stated moment.
+    Authorise,
+    /// Taking back a decision, naming the statement it undoes.
+    ///
+    /// A separate statement rather than a flipped bit, because the bit says the
+    /// decision never happened. "Approved on the 5th, rescinded on the 7th" is
+    /// what occurred; "never approved" is what somebody would want the record
+    /// to say during a dispute.
+    Rescind,
+    /// Taking back something still running, before it has been used.
+    Withdraw,
+}
+
+/// Whether an act takes a term, which is a property of the act and never a
+/// choice on a form.
+///
+/// "This approval expired" is a sentence nobody can answer, and a builder free
+/// to tick that box will eventually tick it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Term {
+    Required,
+    Forbidden,
+}
+
+/// How a statement stops being in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undo {
+    /// Still doing something, so it can be stopped: a status entry, on the
+    /// register of whoever the statement was made out to.
+    StatusList,
+    /// Finished the moment it was made. Undone by a further statement, which
+    /// keeps the history a flipped bit would erase.
+    Counterstatement,
+}
+
+impl Act {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Act::Approve => "approve",
+            Act::Guarantee => "guarantee",
+            Act::Authorise => "authorise",
+            Act::Rescind => "rescind",
+            Act::Withdraw => "withdraw",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "approve" => Act::Approve,
+            "guarantee" => Act::Guarantee,
+            "authorise" => Act::Authorise,
+            "rescind" => Act::Rescind,
+            "withdraw" => Act::Withdraw,
+            _ => return None,
+        })
+    }
+
+    pub fn term(self) -> Term {
+        match self {
+            // Decisions, and the undoing of things: each is complete when made.
+            Act::Approve | Act::Rescind | Act::Withdraw => Term::Forbidden,
+            Act::Guarantee | Act::Authorise => Term::Required,
+        }
+    }
+
+    pub fn undo(self) -> Undo {
+        match self {
+            Act::Guarantee | Act::Authorise => Undo::StatusList,
+            Act::Approve | Act::Rescind | Act::Withdraw => Undo::Counterstatement,
+        }
+    }
+
+    /// The fields the symbol must carry, beyond `until` which [`Term`] governs.
+    ///
+    /// Named here rather than left to the template, so a symbol that renders
+    /// into a sentence with a blank in it is refused at signing instead of read
+    /// by somebody at midnight.
+    pub fn required_fields(self) -> &'static [&'static str] {
+        match self {
+            Act::Approve => &[],
+            Act::Guarantee => &["cap", "ccy"],
+            Act::Authorise => &["scope", "limit"],
+            Act::Rescind | Act::Withdraw => &[],
+        }
+    }
+}
+
+/// The sentence-maker: one act, one version, and the wording in every language
+/// it has been written in.
+///
+/// **Vaulet writes these.** A tenant free to author the wording is a tenant free
+/// to put something unlawful in front of a person, in our app, under our name.
+///
+/// It travels inside the statement rather than behind a URL, so a statement can
+/// be checked offline, years later, by somebody who has never heard of us.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Template {
+    /// Which act this renders.
+    pub act: String,
+    /// Bumped on every change. A template already signed against is never
+    /// edited — a correction is a new version, and statements signed under the
+    /// old wording stay bound to the words they were signed under.
+    pub version: u32,
+    /// Language tag -> the sentence, with `{field}` placeholders.
+    pub wording: BTreeMap<String, String>,
+}
+
+impl Template {
+    /// What the signature covers, so the wording cannot be swapped after the
+    /// fact. Deterministic CBOR (RFC 8949 §4.2) via the encoder this project
+    /// already uses for captures, rather than a second canonicalisation.
+    pub fn hash(&self) -> Result<String> {
+        let mut entries = vec![
+            (
+                crate::dcbor::Cbor::Text("act".into()),
+                crate::dcbor::Cbor::Text(self.act.clone()),
+            ),
+            (
+                crate::dcbor::Cbor::Text("version".into()),
+                crate::dcbor::Cbor::Int(self.version as i64),
+            ),
+        ];
+        let wording: Vec<(crate::dcbor::Cbor, crate::dcbor::Cbor)> = self
+            .wording
+            .iter()
+            .map(|(k, v)| {
+                (
+                    crate::dcbor::Cbor::Text(k.clone()),
+                    crate::dcbor::Cbor::Text(v.clone()),
+                )
+            })
+            .collect();
+        entries.push((
+            crate::dcbor::Cbor::Text("wording".into()),
+            crate::dcbor::Cbor::Map(wording),
+        ));
+        let bytes = crate::dcbor::encode(&crate::dcbor::Cbor::Map(entries))
+            .map_err(|e| CoreError::Protocol(format!("template: {e}")))?;
+        use sha2::Digest;
+        Ok(crate::dcbor::to_hex(&sha2::Sha256::digest(&bytes)))
+    }
+
+    /// Turn a symbol into the sentence somebody reads.
+    ///
+    /// A placeholder with no value is an error rather than an empty space: the
+    /// whole point of the text is that it says what the symbol says, and
+    /// "ค้ำประกันวงเงินไม่เกิน  บาท" says something else.
+    pub fn render(&self, lang: &str, fields: &BTreeMap<String, String>) -> Result<String> {
+        let wording = self
+            .wording
+            .get(lang)
+            .ok_or_else(|| CoreError::Protocol(format!("template has no {lang}")))?;
+        let mut out = String::with_capacity(wording.len());
+        let mut rest = wording.as_str();
+        while let Some(start) = rest.find('{') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let end = after
+                .find('}')
+                .ok_or_else(|| CoreError::Protocol("template: unclosed placeholder".into()))?;
+            let name = &after[..end];
+            let value = fields
+                .get(name)
+                .ok_or_else(|| CoreError::Protocol(format!("template: no value for {name}")))?;
+            out.push_str(value);
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Ok(out)
+    }
+}
+
+/// One statement, before it is signed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Statement {
+    pub act: Act,
+    /// What it is about: the id of a request, a resolution, an earlier
+    /// statement. Opaque here — only the two ends know what it names.
+    pub subject: String,
+    /// The act's values. `until` when the act takes a term.
+    pub fields: BTreeMap<String, String>,
+    pub template: Template,
+    /// Which wording the signer actually read. Kept because a statement signed
+    /// in Thai and one signed in English are not the same act of reading.
+    pub lang: String,
+}
+
+/// A statement's claims, ready to be signed as a credential — and what comes
+/// back out of one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedStatement {
+    pub act: String,
+    pub subject: String,
+    pub fields: BTreeMap<String, String>,
+    pub template: Template,
+    pub template_hash: String,
+    pub lang: String,
+    /// **The sentence the signer read.** Signed alongside the symbol, and
+    /// checked against it by everybody who verifies.
+    pub text: String,
+}
+
+impl Statement {
+    /// Check the act's own rules and render the sentence.
+    ///
+    /// Refused here rather than at the far end: everything below is a mistake
+    /// somebody can still fix, and a statement that reaches a verifier before
+    /// anybody notices has already been signed by a person who believed it.
+    pub fn seal(self) -> Result<SignedStatement> {
+        if self.template.act != self.act.as_str() {
+            return Err(CoreError::Protocol(format!(
+                "template is for {} and the statement is a {}",
+                self.template.act,
+                self.act.as_str()
+            )));
+        }
+        match (self.act.term(), self.fields.contains_key("until")) {
+            (Term::Required, false) => {
+                return Err(CoreError::Protocol(format!(
+                    "{} has to say until when",
+                    self.act.as_str()
+                )))
+            }
+            (Term::Forbidden, true) => {
+                return Err(CoreError::Protocol(format!(
+                    "{} is finished when it is made, so it takes no term",
+                    self.act.as_str()
+                )))
+            }
+            _ => {}
+        }
+        for field in self.act.required_fields() {
+            if !self.fields.contains_key(*field) {
+                return Err(CoreError::Protocol(format!(
+                    "{} needs {field}",
+                    self.act.as_str()
+                )));
+            }
+        }
+        let text = self.template.render(&self.lang, &self.fields)?;
+        Ok(SignedStatement {
+            act: self.act.as_str().to_string(),
+            subject: self.subject,
+            template_hash: self.template.hash()?,
+            fields: self.fields,
+            template: self.template,
+            lang: self.lang,
+            text,
+        })
+    }
+}
+
+/// Read a statement back, and refuse it if the symbol and the sentence
+/// disagree.
+///
+/// **This is the whole of the void rule.** The signature says both halves were
+/// signed together; it cannot say they mean the same thing. Only re-rendering
+/// can, and it costs one template evaluation.
+///
+/// The failure it catches is a template that puts a number in the wrong slot,
+/// or a wording swapped after signing: either would leave a person bound to a
+/// sentence the machine never agreed to, discovered years later in a dispute
+/// rather than today.
+pub fn open(signed: &SignedStatement) -> Result<Act> {
+    let act = Act::parse(&signed.act)
+        .ok_or_else(|| CoreError::Protocol(format!("unknown act {}", signed.act)))?;
+    if signed.template.hash()? != signed.template_hash {
+        return Err(CoreError::Protocol(
+            "the wording is not the wording that was signed".into(),
+        ));
+    }
+    let rendered = signed.template.render(&signed.lang, &signed.fields)?;
+    if rendered != signed.text {
+        return Err(CoreError::Protocol(
+            "what was signed and what was read do not agree".into(),
+        ));
+    }
+    Ok(act)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wording, written as a person would write it. Deliberately not
+    /// generated from anything: it is the half a machine does not produce.
+    fn guarantee_template() -> Template {
+        Template {
+            act: "guarantee".into(),
+            version: 1,
+            wording: BTreeMap::from([
+                (
+                    "th".to_string(),
+                    "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน {cap} {ccy} ถึงวันที่ {until}".to_string(),
+                ),
+                (
+                    "en".to_string(),
+                    "I guarantee up to {cap} {ccy} until {until}".to_string(),
+                ),
+            ]),
+        }
+    }
+
+    fn guarantee() -> Statement {
+        Statement {
+            act: Act::Guarantee,
+            subject: "loan-9021".into(),
+            fields: BTreeMap::from([
+                ("cap".to_string(), "500,000".to_string()),
+                ("ccy".to_string(), "THB".to_string()),
+                ("until".to_string(), "5 กันยายน 2574".to_string()),
+            ]),
+            template: guarantee_template(),
+            lang: "th".into(),
+        }
+    }
+
+    /// The sentence is pinned by hand, because a test that renders it the same
+    /// way the code does agrees with the code and checks nothing. This is what
+    /// a person is meant to read.
+    #[test]
+    fn the_sentence_is_the_one_a_person_would_read() {
+        let signed = guarantee().seal().unwrap();
+        assert_eq!(
+            signed.text,
+            "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 THB ถึงวันที่ 5 กันยายน 2574"
+        );
+    }
+
+    /// **The void rule.** A statement whose text no longer follows from its
+    /// symbol is refused rather than resolved in either direction — our
+    /// rendering bug must not become somebody's debt, and a person must not be
+    /// told that what they read was not what they agreed to.
+    #[test]
+    fn a_text_that_does_not_follow_from_the_symbol_is_void() {
+        let mut signed = guarantee().seal().unwrap();
+        signed.text = "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 5,000,000 THB ถึงวันที่ 5 กันยายน 2574".into();
+        assert!(open(&signed).is_err());
+    }
+
+    /// The other half of the same rule: changing the symbol under a text that
+    /// was signed is caught by the same comparison.
+    #[test]
+    fn a_symbol_edited_under_its_own_sentence_is_void() {
+        let mut signed = guarantee().seal().unwrap();
+        signed
+            .fields
+            .insert("cap".to_string(), "5,000,000".to_string());
+        assert!(open(&signed).is_err());
+    }
+
+    /// And swapping the wording itself, which the hash covers.
+    #[test]
+    fn wording_replaced_after_signing_is_void() {
+        let mut signed = guarantee().seal().unwrap();
+        signed.template.wording.insert(
+            "th".to_string(),
+            "ข้าพเจ้าไม่ได้ค้ำประกันสิ่งใด".to_string(),
+        );
+        assert!(open(&signed).is_err());
+    }
+
+    #[test]
+    fn a_statement_that_agrees_with_itself_opens() {
+        assert_eq!(open(&guarantee().seal().unwrap()).unwrap(), Act::Guarantee);
+    }
+
+    /// An approval is finished the moment it is made. A term on one is a
+    /// sentence nobody can answer — "this approval expired" — so it is refused
+    /// where somebody can still fix it.
+    #[test]
+    fn an_approval_cannot_be_given_a_term() {
+        let mut s = Statement {
+            act: Act::Approve,
+            subject: "leave-441".into(),
+            fields: BTreeMap::from([("role".to_string(), "manager".to_string())]),
+            template: Template {
+                act: "approve".into(),
+                version: 1,
+                wording: BTreeMap::from([("th".to_string(), "อนุมัติโดย {role}".to_string())]),
+            },
+            lang: "th".into(),
+        };
+        assert!(s.clone().seal().is_ok());
+
+        s.fields
+            .insert("until".to_string(), "2031-09-05".to_string());
+        assert!(s.seal().is_err());
+    }
+
+    /// And the reverse: what stays in force has to say for how long.
+    #[test]
+    fn a_guarantee_without_a_term_is_refused() {
+        let mut s = guarantee();
+        s.fields.remove("until");
+        assert!(s.seal().is_err());
+    }
+
+    #[test]
+    fn a_guarantee_without_its_cap_is_refused() {
+        let mut s = guarantee();
+        s.fields.remove("cap");
+        assert!(s.seal().is_err());
+    }
+
+    /// A template belonging to another act cannot be used to render this one —
+    /// otherwise a guarantee could be signed under an approval's sentence.
+    #[test]
+    fn a_template_for_another_act_is_refused() {
+        let mut s = guarantee();
+        s.template.act = "approve".into();
+        assert!(s.seal().is_err());
+    }
+
+    /// A placeholder with nothing to put in it must not render as a gap. The
+    /// sentence is what binds somebody, and one with a hole in it says
+    /// something other than what was meant.
+    #[test]
+    fn a_missing_value_is_an_error_not_a_blank() {
+        let mut s = guarantee();
+        s.template
+            .wording
+            .insert("th".to_string(), "ค้ำ {cap} {ccy} ถึง {until} เงื่อนไข {extra}".to_string());
+        assert!(s.seal().is_err());
+    }
+
+    /// Which act stops how, asserted rather than described — the difference
+    /// between a flipped bit and a further statement is the difference between
+    /// a record that says a decision never happened and one that says when it
+    /// was undone.
+    #[test]
+    fn what_is_still_running_is_stopped_and_what_is_done_is_answered() {
+        assert_eq!(Act::Guarantee.undo(), Undo::StatusList);
+        assert_eq!(Act::Authorise.undo(), Undo::StatusList);
+        assert_eq!(Act::Approve.undo(), Undo::Counterstatement);
+        assert_eq!(Act::Rescind.undo(), Undo::Counterstatement);
+    }
+
+    /// The wording is signed, so the two languages of one template are one
+    /// artefact: translating cannot be done quietly afterwards.
+    #[test]
+    fn the_hash_covers_every_language() {
+        let a = guarantee_template().hash().unwrap();
+        let mut other = guarantee_template();
+        other
+            .wording
+            .insert("en".to_string(), "I guarantee everything".to_string());
+        assert_ne!(a, other.hash().unwrap());
+    }
+
+    /// Reading in Thai and reading in English are two different acts of
+    /// reading, and the statement records which one happened.
+    #[test]
+    fn the_language_read_is_part_of_what_was_signed() {
+        let mut english = guarantee();
+        english.lang = "en".into();
+        let signed = english.seal().unwrap();
+        assert_eq!(signed.text, "I guarantee up to 500,000 THB until 5 กันยายน 2574");
+        assert_eq!(signed.lang, "en");
+    }
+}
