@@ -498,7 +498,7 @@ pub fn wallet_present(
 /// what they put their name to. A wallet that rendered from anywhere else would
 /// be showing a sentence nobody signed.
 pub fn wallet_read_statement_ask(ask_json: &str, lang: &str) -> Result<String> {
-    let ask: protocol::oid4vp::StatementAsk = serde_json::from_str(ask_json)
+    let ask: statement::Ask = serde_json::from_str(ask_json)
         .map_err(|e| CoreError::Protocol(format!("statement ask: {e}")))?;
     let act = statement::Act::parse(&ask.act)
         .ok_or_else(|| CoreError::Protocol(format!("unknown act {}", ask.act)))?;
@@ -531,7 +531,7 @@ pub fn wallet_sign_statement(
     iat: i64,
     exp: i64,
 ) -> Result<String> {
-    let ask: protocol::oid4vp::StatementAsk = serde_json::from_str(ask_json)
+    let ask: statement::Ask = serde_json::from_str(ask_json)
         .map_err(|e| CoreError::Protocol(format!("statement ask: {e}")))?;
     let act = statement::Act::parse(&ask.act)
         .ok_or_else(|| CoreError::Protocol(format!("unknown act {}", ask.act)))?;

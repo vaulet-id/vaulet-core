@@ -228,6 +228,29 @@ impl Template {
     }
 }
 
+/// What a request asks somebody to put their name to, as it is published.
+///
+/// **Everything the sentence needs is fixed by the request**, so the wallet
+/// renders exactly what will be signed and the person reads the whole of it
+/// before agreeing. A field left for the signer to fill would be a sentence
+/// they compose about themselves, which is the one thing a statement is not.
+///
+/// Lives here rather than beside the OID4VP types, and travels on the request
+/// document rather than on the presentation-request: an OID4VP ask exists to
+/// request presentations of credentials that already exist. "Sign this new
+/// thing" is a different kind of asking, and putting it there would have made
+/// one message mean two things.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ask {
+    pub act: String,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub fields: BTreeMap<String, String>,
+    /// The wording, stamped by the issuer that publishes the request.
+    pub template: Template,
+}
+
 /// One statement, before it is signed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Statement {
