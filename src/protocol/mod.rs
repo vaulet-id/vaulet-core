@@ -140,9 +140,8 @@ pub mod oid4vci {
             match k {
                 "credential_offer" => {
                     let json = percent_decode(v)?;
-                    let offer = serde_json::from_str(&json).map_err(|e| {
-                        CoreError::Protocol(format!("credential_offer json: {e}"))
-                    })?;
+                    let offer = serde_json::from_str(&json)
+                        .map_err(|e| CoreError::Protocol(format!("credential_offer json: {e}")))?;
                     return Ok(ParsedOffer::ByValue(offer));
                 }
                 "credential_offer_uri" => {
@@ -423,8 +422,7 @@ pub mod oid4vci {
     fn percent_encode(s: &str) -> String {
         let mut out = String::with_capacity(s.len() * 3);
         for b in s.bytes() {
-            let unreserved = b.is_ascii_alphanumeric()
-                || matches!(b, b'-' | b'_' | b'.' | b'~');
+            let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
             if unreserved {
                 out.push(b as char);
             } else {
@@ -493,10 +491,11 @@ pub mod oid4vci {
         #[test]
         fn offer_grant_uses_spec_key() {
             let json = serde_json::to_value(sample_offer()).unwrap();
-            assert!(json["grants"]
-                ["urn:ietf:params:oauth:grant-type:pre-authorized_code"]
-                ["pre-authorized_code"]
-                .is_string());
+            assert!(
+                json["grants"]["urn:ietf:params:oauth:grant-type:pre-authorized_code"]
+                    ["pre-authorized_code"]
+                    .is_string()
+            );
         }
 
         #[test]
@@ -728,14 +727,24 @@ pub mod oid4vp {
                             .next()
                             .unwrap_or(&r.vct)
                             .chars()
-                            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+                            .map(|c| {
+                                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                                    c
+                                } else {
+                                    '_'
+                                }
+                            })
                             .collect(),
                         format: "dc+sd-jwt".to_string(),
-                        meta: DcqlMeta { vct_values: vec![r.vct.clone()] },
+                        meta: DcqlMeta {
+                            vct_values: vec![r.vct.clone()],
+                        },
                         claims: r
                             .claims
                             .iter()
-                            .map(|c| DcqlClaim { path: vec![c.clone()] })
+                            .map(|c| DcqlClaim {
+                                path: vec![c.clone()],
+                            })
                             .collect(),
                     })
                     .collect(),
@@ -774,6 +783,57 @@ pub mod oid4vp {
         /// identical to the OID4VCI `credential_issuer`, so one identity both
         /// issues and verifies.
         pub audience: String,
+        /// Everybody this request needs, when it needs more than one person
+        /// (ADR 0027). **Absent for every request with a single role**, which is
+        /// every request published so far — a wallet or a self-hosted issuer
+        /// that has never heard of roles keeps working unchanged, which is the
+        /// test the protocol was designed to pass.
+        ///
+        /// The first entry is the role whoever asked for this is answering; the
+        /// rest are the people they have to bring.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub roles: Vec<PresentationRole>,
+        /// The attempt these roles are answering together, minted with the
+        /// nonce. Whoever starts passes it to the people they invite, and every
+        /// [`SatisfyRequest`] for the same attempt carries it back.
+        ///
+        /// Absent alongside [`Self::roles`], and for the same reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session: Option<String>,
+    }
+
+    /// One person's part of a request that needs more than one (ADR 0027).
+    ///
+    /// What each must present is here rather than referred to elsewhere, so the
+    /// wallet can show an invitation — *"send your passport"* — without first
+    /// fetching the whole request it is a part of.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct PresentationRole {
+        /// Stable within the request: `applicant`, `companion`, `guarantor`.
+        pub id: String,
+        /// What to call this part when somebody is invited to it.
+        #[serde(default)]
+        pub title: String,
+        /// What this role must present, in the same shape as
+        /// [`PresentationRequest::required`].
+        #[serde(default)]
+        pub required: Vec<RequestedCredential>,
+        /// The same ask in the standard's language.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub dcql_query: Option<DcqlQuery>,
+        /// Roles this one may not be answered by the same key as — published so
+        /// a verifier reads the rule rather than trusting it was enforced.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub distinct_from: Vec<String>,
+        /// Whether the request completes without this role answering.
+        #[serde(default)]
+        pub optional: bool,
+        /// Whether answering this role earns a credential. **False is a real
+        /// answer**: a guarantor signs and wants no card in their wallet saying
+        /// so, and the person being invited should be told which it is before
+        /// they hand over a passport.
+        #[serde(default)]
+        pub issues: bool,
     }
 
     impl PresentationRequest {
@@ -811,6 +871,15 @@ pub mod oid4vp {
         /// published so far.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub claims_jws: Option<String>,
+        /// Which [`PresentationRole`] this answers. Absent means the only one,
+        /// so a request with a single role is answered exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<String>,
+        /// The attempt this joins — [`PresentationRequest::session`], passed on
+        /// by whoever did the inviting. Absent means "on its own", which is
+        /// every request with one role.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session: Option<String>,
     }
 
     /// The payload of a signed form submission.
@@ -858,6 +927,28 @@ pub mod oid4vp {
         Ok(format!("{signing_input}.{}", B64.encode(sig)))
     }
 
+    /// The key a signed submission names as its own, from the JWS header.
+    ///
+    /// **Only for a submission that presents no credential**, where there is no
+    /// other key to check against and the typed answers are the entire
+    /// contribution. Anywhere a presentation exists, the presentations' key is
+    /// the one that counts — see [`verify_form_claims`] for why.
+    pub fn form_claims_key(compact: &str) -> crate::Result<serde_json::Value> {
+        let h = compact
+            .split('.')
+            .next()
+            .ok_or_else(|| crate::CoreError::Protocol("form claims: empty".into()))?;
+        let header: serde_json::Value = serde_json::from_slice(
+            &B64.decode(h)
+                .map_err(|e| crate::CoreError::Protocol(format!("form claims b64: {e}")))?,
+        )
+        .map_err(|e| crate::CoreError::Protocol(format!("form claims header: {e}")))?;
+        header
+            .get("jwk")
+            .cloned()
+            .ok_or_else(|| crate::CoreError::Protocol("form claims: no key in the header".into()))
+    }
+
     /// Verify a signed form submission and return the typed fields.
     ///
     /// `holder_jwk` is the key that signed the PRESENTATIONS in the same
@@ -876,7 +967,11 @@ pub mod oid4vp {
         let mut parts = compact.split('.');
         let (h, p, s) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some(h), Some(p), Some(s), None) => (h, p, s),
-            _ => return Err(crate::CoreError::Protocol("form claims: not a 3-part JWS".into())),
+            _ => {
+                return Err(crate::CoreError::Protocol(
+                    "form claims: not a 3-part JWS".into(),
+                ))
+            }
         };
         let payload: FormClaims = serde_json::from_slice(
             &B64.decode(p)
@@ -885,10 +980,14 @@ pub mod oid4vp {
         .map_err(|e| crate::CoreError::Protocol(format!("form claims json: {e}")))?;
 
         if payload.aud != audience {
-            return Err(crate::CoreError::Protocol("form claims: wrong audience".into()));
+            return Err(crate::CoreError::Protocol(
+                "form claims: wrong audience".into(),
+            ));
         }
         if payload.nonce != nonce {
-            return Err(crate::CoreError::Protocol("form claims: wrong nonce".into()));
+            return Err(crate::CoreError::Protocol(
+                "form claims: wrong nonce".into(),
+            ));
         }
 
         let vk = crate::credential::verifying_key_from_jwk(holder_jwk)?;
@@ -898,7 +997,9 @@ pub mod oid4vp {
         )
         .map_err(|e| crate::CoreError::Protocol(format!("form claims sig: {e}")))?;
         vk.verify(format!("{h}.{p}").as_bytes(), &sig)
-            .map_err(|_| crate::CoreError::Protocol("form claims: signature does not verify".into()))?;
+            .map_err(|_| {
+                crate::CoreError::Protocol("form claims: signature does not verify".into())
+            })?;
 
         Ok(payload.claims)
     }
@@ -914,7 +1015,28 @@ pub mod oid4vp {
         /// **Pre-gated**: the verified presentation WAS the gate, so this offer
         /// carries no `tx_code` and its token exchange skips the OTP check. Feed
         /// straight to the wallet claim flow.
-        pub credential_offer_uri: String,
+        ///
+        /// **Absent when there is nothing yet**, which only happens on a request
+        /// with more than one role: the others have not answered, or this role
+        /// earns nothing by design. Read [`Self::waiting_for`] to tell those two
+        /// apart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub credential_offer_uri: Option<String>,
+        /// Roles still to answer before anything is issued. Empty on every
+        /// single-role request, so nothing that reads only the offer changes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub waiting_for: Vec<String>,
+        /// The receipt for a contribution parked while others finish: it
+        /// collects the offer once the request completes, and takes the
+        /// contribution back until it does.
+        ///
+        /// Handed only to whoever just answered, over the connection that
+        /// carried their presentation. A bearer string rather than a signature
+        /// because the alternative — a fresh proof of the holder's key for a
+        /// poll — is a second protocol for somebody else to implement, and this
+        /// one is a `HashMap` lookup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub collect_token: Option<String>,
     }
 
     #[cfg(test)]
@@ -937,7 +1059,10 @@ pub mod oid4vp {
             let c = &q.credentials[0];
 
             assert_eq!(c.format, "dc+sd-jwt");
-            assert_eq!(c.meta.vct_values, ["https://issuer.example/credential/verified_email"]);
+            assert_eq!(
+                c.meta.vct_values,
+                ["https://issuer.example/credential/verified_email"]
+            );
             assert_eq!(c.claims[0].path, ["email"]);
             // A vct is a URL and cannot be an id, so one is derived that fits
             // the alphabet DCQL allows.
@@ -976,10 +1101,19 @@ pub mod oid4vp {
                 dcql_query: None,
                 nonce: "vp-nonce-123".into(),
                 audience: "https://issuer.example".into(),
+                roles: vec![],
+                session: None,
             };
             let v = serde_json::to_value(&req).unwrap();
             assert_eq!(v["manifest_id"], json!("codefin-identity"));
-            assert_eq!(v["required"][0]["vct"], json!("https://issuer.example/credential/verified_email"));
+            // A request one person answers says nothing about roles at all —
+            // the shape a shipped wallet and a self-hosted issuer already read.
+            assert!(v.get("roles").is_none(), "{v}");
+            assert!(v.get("session").is_none(), "{v}");
+            assert_eq!(
+                v["required"][0]["vct"],
+                json!("https://issuer.example/credential/verified_email")
+            );
             assert_eq!(v["required"][0]["claims"][0], json!("email"));
             assert_eq!(v["nonce"], json!("vp-nonce-123"));
             assert_eq!(v["audience"], json!("https://issuer.example"));
@@ -1002,6 +1136,8 @@ pub mod oid4vp {
                 presentations: vec!["eyJ...~kb1".into(), "eyJ...~kb2".into()],
                 nonce: "vp-nonce-123".into(),
                 claims_jws: None,
+                role: None,
+                session: None,
             };
             let v = serde_json::to_value(&req).unwrap();
             assert_eq!(v["presentations"].as_array().unwrap().len(), 2);
@@ -1014,7 +1150,10 @@ pub mod oid4vp {
                     "openid-credential-offer://?credential_offer_uri=https%3A%2F%2Fissuer.example%2Fapi%2Fv1%2Foffers%2Fabc"
             }))
             .unwrap();
-            assert!(resp.credential_offer_uri.starts_with("openid-credential-offer://"));
+            assert!(resp
+                .credential_offer_uri
+                .unwrap()
+                .starts_with("openid-credential-offer://"));
         }
 
         #[test]
@@ -1024,7 +1163,10 @@ pub mod oid4vp {
                 claims: vec![],
             };
             let v = serde_json::to_value(&rc).unwrap();
-            assert!(v.get("claims").is_none(), "empty claims must be skipped on the wire");
+            assert!(
+                v.get("claims").is_none(),
+                "empty claims must be skipped on the wire"
+            );
         }
 
         use crate::keys::software::SoftwareKey;
@@ -1050,8 +1192,7 @@ pub mod oid4vp {
             )
             .unwrap();
 
-            let claims =
-                verify_form_claims(&jws, "https://issuer.example", "n-1", &jwk).unwrap();
+            let claims = verify_form_claims(&jws, "https://issuer.example", "n-1", &jwk).unwrap();
             assert_eq!(claims["address"], "12 Sukhumvit Rd");
         }
 
@@ -1134,13 +1275,10 @@ pub mod oid4vp {
                 .unwrap(),
             );
             parts[1] = &edited;
-            assert!(verify_form_claims(
-                &parts.join("."),
-                "https://issuer.example",
-                "n-1",
-                &jwk
-            )
-            .is_err());
+            assert!(
+                verify_form_claims(&parts.join("."), "https://issuer.example", "n-1", &jwk)
+                    .is_err()
+            );
         }
 
         /// A submission with no typed fields carries no claims block at all, so
@@ -1151,6 +1289,8 @@ pub mod oid4vp {
                 presentations: vec!["vp".into()],
                 nonce: "n-1".into(),
                 claims_jws: None,
+                role: None,
+                session: None,
             })
             .unwrap();
             assert!(v.get("claims_jws").is_none(), "{v}");
