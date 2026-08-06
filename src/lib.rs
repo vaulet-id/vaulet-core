@@ -13,6 +13,7 @@ pub mod keys;
 pub mod mnemonic;
 pub mod protocol;
 pub mod recovery;
+pub mod rule;
 pub mod requests;
 pub mod statement;
 pub mod vouching;
