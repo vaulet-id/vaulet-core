@@ -77,6 +77,86 @@ pub fn template() -> crate::statement::Template {
     }
 }
 
+/// Where an ask lands: a path the app claims, and a fragment browsers never
+/// send. **The fragment matters here more than usual** — the whole point is
+/// that a director can be asked without our server learning that they were.
+pub const ASK_LINK_PREFIX: &str = "https://app.vaulet.id/m#";
+
+/// A director being asked to authorise one manifest.
+///
+/// **Everything needed to sign is in it.** No lookup, no session, no server:
+/// somebody who received this by LINE, on a plane, from a company that left
+/// Vaulet last year can still read the sentence and sign it. That is the test
+/// of whether this is really non-custodial, and it is why the digest and the
+/// wording travel in the ask rather than being fetched.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Ask {
+    /// The organisation being acted for.
+    pub org: String,
+    /// Its name, so the ask reads as something. Self-asserted, like a display
+    /// name — the sentence a director signs names the DID, not this.
+    #[serde(default)]
+    pub org_name: String,
+    /// [`digest`] of the manifest bytes, which is what the signature binds to.
+    pub manifest_digest: String,
+    /// What the manifest is called, for the same reason as `org_name`.
+    #[serde(default)]
+    pub title: String,
+    /// Until when the authority runs, as `YYYY-MM-DD`.
+    pub until: String,
+}
+
+impl Ask {
+    /// The statement this ask becomes once a director agrees to it.
+    ///
+    /// Built here rather than in the wallet, so the sentence a director reads
+    /// and the one an issuer checks come from one place. A wallet that composed
+    /// its own fields would be the second implementation this design keeps
+    /// warning about.
+    pub fn statement(&self) -> crate::statement::Statement {
+        crate::statement::Statement {
+            act: Act::Authorise,
+            subject: self.manifest_digest.clone(),
+            fields: std::collections::BTreeMap::from([
+                (
+                    "about".to_string(),
+                    if self.title.is_empty() {
+                        "this request".to_string()
+                    } else {
+                        self.title.clone()
+                    },
+                ),
+                ("scope".to_string(), "issue credentials".to_string()),
+                ("limit".to_string(), "this request only".to_string()),
+                ("org".to_string(), self.org.clone()),
+                ("until".to_string(), self.until.clone()),
+            ]),
+            template: template(),
+            lang: String::new(),
+        }
+    }
+
+    pub fn to_link(&self) -> Result<String> {
+        let json = serde_json::to_vec(self)
+            .map_err(|e| CoreError::Protocol(format!("mandate ask json: {e}")))?;
+        Ok(format!("{ASK_LINK_PREFIX}{}", B64.encode(json)))
+    }
+
+    /// Read one back, from the whole link or from the fragment alone — the app
+    /// receives the fragment by itself from the platform.
+    pub fn from_link(link: &str) -> Result<Self> {
+        let payload = link.rsplit('#').next().unwrap_or_default();
+        if payload.is_empty() {
+            return Err(CoreError::Protocol("an empty mandate link".into()));
+        }
+        let raw = B64
+            .decode(payload)
+            .map_err(|e| CoreError::Protocol(format!("mandate link b64: {e}")))?;
+        serde_json::from_slice(&raw)
+            .map_err(|e| CoreError::Protocol(format!("mandate link json: {e}")))
+    }
+}
+
 /// The digest a director's signature names: SHA-256 of the manifest bytes as
 /// they were submitted.
 pub fn digest(manifest_bytes: &[u8]) -> String {
@@ -338,6 +418,62 @@ mod tests {
         let signers: Vec<String> = read.iter().map(|a| a.signer.clone()).collect();
         assert_eq!(signers.len(), 2);
         assert!(!enough(&rule, &signers));
+    }
+
+    /// An ask carries everything needed to sign it. A director who received it
+    /// by LINE, offline, from a company that left Vaulet last year can still
+    /// read the sentence and sign — which is the test of whether any of this is
+    /// really non-custodial.
+    #[test]
+    fn an_ask_round_trips_through_a_link_and_signs() {
+        let ask = Ask {
+            org: ORG.into(),
+            org_name: "Acme Co., Ltd.".into(),
+            manifest_digest: "m".into(),
+            title: "Membership".into(),
+            until: "2027-12-31".into(),
+        };
+        let back = Ask::from_link(&ask.to_link().unwrap()).unwrap();
+        assert_eq!(back, ask);
+
+        // And what it becomes is exactly what `read` accepts, which is the join
+        // this test exists for: two ends of one flow, one set of fields.
+        let key = SoftwareKey::generate();
+        let jwk = key.public_jwk().unwrap();
+        let did = crate::did::did_jwk_from_public(&jwk).unwrap();
+        let mut statement = back.statement();
+        statement.lang = "th".into();
+        let sd_jwt = issue_statement(
+            statement,
+            "https://vaulet.id/credential/mandate",
+            &did,
+            jwk,
+            NOW - 10,
+            NOW + 10 * 365 * 24 * 3600,
+            &key,
+        )
+        .unwrap();
+
+        let read = read(&[sd_jwt], ORG, "m", NOW).unwrap();
+        assert_eq!(read[0].signer, did);
+        assert!(read[0].statement.text.contains("Acme") || read[0].statement.text.contains(ORG));
+    }
+
+    /// The fragment is not decoration. A link tapped by somebody without the
+    /// app must tell our server nothing about who was asked.
+    #[test]
+    fn nothing_of_the_ask_leaves_the_fragment() {
+        let ask = Ask {
+            org: ORG.into(),
+            org_name: "Acme".into(),
+            manifest_digest: "secret-digest".into(),
+            title: "Membership".into(),
+            until: "2027-12-31".into(),
+        };
+        let link = ask.to_link().unwrap();
+        let before_fragment = link.split('#').next().unwrap();
+        assert_eq!(before_fragment, "https://app.vaulet.id/m");
+        assert!(!before_fragment.contains("secret-digest"));
     }
 
     /// The digest is of the bytes as sent. Reformatting the same manifest is a
