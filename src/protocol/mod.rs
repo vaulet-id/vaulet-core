@@ -1142,6 +1142,7 @@ pub mod oid4vp {
                 claims_jws: None,
                 role: None,
                 session: None,
+                statement: None,
             };
             let v = serde_json::to_value(&req).unwrap();
             assert_eq!(v["presentations"].as_array().unwrap().len(), 2);
@@ -1295,6 +1296,7 @@ pub mod oid4vp {
                 claims_jws: None,
                 role: None,
                 session: None,
+                statement: None,
             })
             .unwrap();
             assert!(v.get("claims_jws").is_none(), "{v}");
