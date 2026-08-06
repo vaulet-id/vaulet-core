@@ -564,6 +564,28 @@ fn title_from_vct(vct: &str) -> String {
 /// in the SD-JWT JOSE header `kid`; when the header omits `kid` (our [`issue`]
 /// path), fall back to the first `verificationMethod`'s `publicKeyJwk`.
 fn issuer_jwk_from_did_doc(sd_jwt: &str, did_doc: &Value) -> Result<Value> {
+    // **The document must be the one the credential names.** Every caller
+    // supplies a document it fetched from somewhere it chose, and without this
+    // nothing ties the two together: a credential claiming
+    // `did:web:org.vaulet.id:bank` would verify against whatever key the site
+    // that offered it publishes, and the wallet would store a card in the
+    // bank's name signed by a stranger.
+    //
+    // Key pinning hid this while every issuer was `vaulet.id` and pinned. It
+    // stops hiding it the moment a wallet accepts an issuer it has never seen,
+    // which is the direction ADR 0030 takes. The check lives here rather than
+    // in the two callers because a third one would forget it.
+    let iss = extract_iss(sd_jwt)?;
+    match did_doc.get("id").and_then(Value::as_str) {
+        Some(id) if id == iss => {}
+        Some(id) => {
+            return Err(CoreError::Credential(format!(
+                "credential says it was issued by {iss}, but the document is {id}"
+            )))
+        }
+        None => return Err(CoreError::Credential("did doc has no id".into())),
+    }
+
     let header = decode_jwt_header(sd_jwt)?;
     if let Some(kid) = header.get("kid").and_then(Value::as_str) {
         return signing_jwk_for_kid(did_doc, kid);
@@ -592,6 +614,16 @@ fn decode_jwt_header(sd_jwt: &str) -> Result<Value> {
         .decode(header_b64)
         .map_err(|e| CoreError::Credential(format!("header b64: {e}")))?;
     serde_json::from_slice(&bytes).map_err(|e| CoreError::Credential(format!("header json: {e}")))
+}
+
+/// Where to fetch the document that can verify this credential.
+///
+/// **Derived from the credential, never from wherever it arrived.** A wallet
+/// that fetched the document from the site that offered it would be asking the
+/// signer to vouch for itself; [`issuer_jwk_from_did_doc`] refuses the result,
+/// but the fetch should not have been aimed there in the first place.
+pub fn issuer_document_url(sd_jwt: &str) -> Result<String> {
+    crate::did::did_web_url(&extract_iss(sd_jwt)?)
 }
 
 /// Read the `iss` (issuer identifier, a `did:web` in M1) from an SD-JWT payload
@@ -936,6 +968,51 @@ mod tests {
                 "publicKeyJwk": issuer_jwk,
             }],
         })
+    }
+
+    /// The attack this closes: a site offers a credential that says it came
+    /// from somebody trusted, and serves its own document to verify it against.
+    /// Both halves are internally consistent — a real signature by a real key,
+    /// found in a real document — and the only thing that catches it is asking
+    /// whether the document is the one the credential named.
+    #[test]
+    fn a_document_that_is_not_the_issuer_the_credential_names_is_refused() {
+        let stranger = SoftwareKey::generate();
+        let holder = SoftwareKey::generate();
+        // Signed by the stranger, and their document really does publish their
+        // key — under their own name.
+        let sd_jwt = issue(sample_params(&holder), &stranger).unwrap();
+        let mut doc = did_doc_for(&stranger.public_jwk().unwrap());
+        doc["id"] = json!("did:web:evil.example");
+
+        let e = verify_with_did_document(&sd_jwt, &doc, 1_700_000_000).unwrap_err();
+        assert!(
+            e.to_string().contains("did:web:evil.example"),
+            "the error must name both parties, got: {e}"
+        );
+        // And the ingest path, which is the one a wallet takes.
+        assert!(ingest_with_did_document(
+            "c",
+            &sd_jwt,
+            &doc,
+            1_700_000_000,
+            DisplayHints::default(),
+            &[]
+        )
+        .is_err());
+    }
+
+    /// A document with no `id` cannot be tied to anything, so it is refused
+    /// rather than treated as "no claim made".
+    #[test]
+    fn a_document_without_an_id_verifies_nothing() {
+        let issuer = SoftwareKey::generate();
+        let holder = SoftwareKey::generate();
+        let sd_jwt = issue(sample_params(&holder), &issuer).unwrap();
+        let mut doc = did_doc_for(&issuer.public_jwk().unwrap());
+        doc.as_object_mut().unwrap().remove("id");
+
+        assert!(verify_with_did_document(&sd_jwt, &doc, 1_700_000_000).is_err());
     }
 
     #[test]
