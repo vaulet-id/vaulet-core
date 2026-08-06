@@ -190,7 +190,7 @@ pub fn verify(sd_jwt: &str, issuer_jwk: &Value, now: i64) -> Result<VerifiedCred
         .split('~')
         .next()
         .ok_or_else(|| CoreError::Credential("empty sd-jwt".into()))?;
-    let payload = verify_compact_es256(jwt_part, &issuer_vk)?;
+    let payload = verify_compact_jws(jwt_part, &issuer_vk)?;
 
     // (2) Expiry.
     let exp = payload
@@ -307,7 +307,7 @@ pub fn verify_presentation(
 
     // KB-JWT must be signed by the holder key advertised in cnf.jwk.
     let holder_vk = verifying_key_from_jwk(&verified.holder_jwk)?;
-    let kb_payload = verify_compact_es256(&kb.to_string(), &holder_vk)?;
+    let kb_payload = verify_compact_jws(&kb.to_string(), &holder_vk)?;
 
     if kb_payload.get("aud").and_then(Value::as_str) != Some(audience) {
         return Err(CoreError::Credential("KB-JWT audience mismatch".into()));
@@ -394,7 +394,7 @@ pub fn status_is_revoked(
     expected_uri: &str,
 ) -> Result<bool> {
     let vk = verifying_key_from_jwk(issuer_jwk)?;
-    let payload = verify_compact_es256(list_jwt, &vk)?;
+    let payload = verify_compact_jws(list_jwt, &vk)?;
 
     // The list must say it is the list we went looking for. Without this, a
     // list legitimately signed by the issuer for one purpose could be served in
@@ -453,7 +453,7 @@ pub fn verify_with_did_document(
     did_doc: &Value,
     now: i64,
 ) -> Result<VerifiedCredential> {
-    let issuer_jwk = issuer_jwk_from_did_doc(sd_jwt, did_doc)?;
+    let issuer_jwk = issuer_jwk_for(sd_jwt, did_doc)?;
     verify(sd_jwt, &issuer_jwk, now)
 }
 
@@ -485,7 +485,7 @@ pub fn ingest_with_did_document(
     hints: DisplayHints,
     pinned: &[String],
 ) -> Result<StoredCredential> {
-    let issuer_jwk = issuer_jwk_from_did_doc(sd_jwt, did_doc)?;
+    let issuer_jwk = issuer_jwk_for(sd_jwt, did_doc)?;
     // Issuer key pinning (SSI trust registry, ADR 0008 / SECURITY-REVIEW): when
     // the caller pins expected key thumbprint(s) for this issuer, the key that
     // actually verifies the credential must be one of them. This anchors trust
@@ -563,7 +563,7 @@ fn title_from_vct(vct: &str) -> String {
 /// Pick the issuer signing JWK out of a resolved DID document for the key named
 /// in the SD-JWT JOSE header `kid`; when the header omits `kid` (our [`issue`]
 /// path), fall back to the first `verificationMethod`'s `publicKeyJwk`.
-fn issuer_jwk_from_did_doc(sd_jwt: &str, did_doc: &Value) -> Result<Value> {
+pub(crate) fn issuer_jwk_for(sd_jwt: &str, did_doc: &Value) -> Result<Value> {
     // **The document must be the one the credential names.** Every caller
     // supplies a document it fetched from somewhere it chose, and without this
     // nothing ties the two together: a credential claiming
@@ -620,7 +620,7 @@ fn decode_jwt_header(sd_jwt: &str) -> Result<Value> {
 ///
 /// **Derived from the credential, never from wherever it arrived.** A wallet
 /// that fetched the document from the site that offered it would be asking the
-/// signer to vouch for itself; [`issuer_jwk_from_did_doc`] refuses the result,
+/// signer to vouch for itself; [`issuer_jwk_for`] refuses the result,
 /// but the fetch should not have been aimed there in the first place.
 pub fn issuer_document_url(sd_jwt: &str) -> Result<String> {
     crate::did::did_web_url(&extract_iss(sd_jwt)?)
@@ -655,7 +655,7 @@ pub(crate) fn verifying_key_from_jwk(jwk: &Value) -> Result<VerifyingKey> {
 }
 
 /// Verify a compact ES256 JWS and return its decoded JSON payload.
-fn verify_compact_es256(jws: &str, vk: &VerifyingKey) -> Result<Value> {
+pub(crate) fn verify_compact_jws(jws: &str, vk: &VerifyingKey) -> Result<Value> {
     let parts: Vec<&str> = jws.split('.').collect();
     if parts.len() != 3 {
         return Err(CoreError::Credential("not a 3-part JWS".into()));
