@@ -25,6 +25,7 @@ pub mod handle;
 pub mod inbox;
 pub mod invitation;
 pub mod message;
+pub mod owed;
 pub mod push;
 mod state;
 
