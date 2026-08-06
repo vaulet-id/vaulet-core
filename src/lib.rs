@@ -12,6 +12,7 @@ pub mod emrtd;
 pub mod keys;
 pub mod mnemonic;
 pub mod protocol;
+pub mod mandate;
 pub mod recovery;
 pub mod rule;
 pub mod requests;
