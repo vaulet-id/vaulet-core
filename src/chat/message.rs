@@ -224,6 +224,31 @@ pub struct RoomAddressBody {
     /// opens it (ADR 0016) — which is why it can travel in a room without
     /// telling the room's members anything about each other's devices.
     pub push_ticket: String,
+
+    /// What this member calls themselves, for the others to show.
+    ///
+    /// **A room had no way to learn anybody's name.** It was recorded once, by
+    /// whoever did the inviting, from the private nickname *they* had for that
+    /// person — so the inviter saw names and everybody else saw none, and
+    /// changing your name reached your contacts and never the rooms you were
+    /// in. It belongs here because this is the one thing each member says about
+    /// themselves inside the room, where MLS says who is speaking.
+    ///
+    /// Self-asserted, like every other display name (ADR 0015): a label chosen
+    /// by the person, never an identity. Empty from a build that predates it.
+    #[serde(default)]
+    pub name: String,
+
+    /// Whether this member is leaving, and their address is about to stop
+    /// existing.
+    ///
+    /// **Walking out used to be invisible to everybody else.** Leaving destroys
+    /// the box the room writes to and sends no commit — there is no way for a
+    /// member to commit their own removal — so the others went on addressing a
+    /// box that was gone, and every message any of them typed was reported as
+    /// reaching one fewer than everybody, for ever, with nothing saying why.
+    #[serde(default)]
+    pub leaving: bool,
 }
 
 /// The body of [`ROOM_NAME`].
