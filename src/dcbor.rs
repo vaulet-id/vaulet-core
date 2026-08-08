@@ -385,166 +385,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // THE SHARED VECTOR. This envelope mirrors, field for field, the fixture in
-    // app/test/belt_bundle_test.dart (`_sample(sessionType: 'bona_fide')`), and
-    // the same two goldens are asserted there against the Dart encoder. If the
-    // two encoders ever disagree, exactly one of these two tests goes red.
-    //
-    // Every number below is written with the type the Dart side produces: the
-    // BeltFeatureSample fields are `double` (so `1.0`, `-1.0`), while t_ms /
-    // w / h / captured_at / clock_base / ts are `int`.
+    // THE SHARED VECTORS. The envelope, the encoded length and the hash all come
+    // from vectors/belt/*.json, which backend/src/belt_envelope.rs and
+    // app/test/belt_bundle_test.dart assert against too. Nothing here restates a
+    // number: a vector this encoder could regenerate would only prove that the
+    // encoder agrees with itself. See vectors/README.md.
     // -----------------------------------------------------------------------
 
-    /// The belt_v1 envelope fixture, shaped exactly like `BeltBundle.hashedContent()`.
-    fn belt_envelope_fixture() -> serde_json::Value {
-        json!({
-            "belt_version": "2.0",
-            "session_id": "sess-1",
-            "nonce": "nonce-1",
-            "platform": "ios",
-            "captured_at": 1700000000000i64,
-            "clock_base": 0,
-            "capture": {
-                "media": {
-                    "rgb_clip": {
-                        "frames": [
-                            {"t_ms": 0, "hash": "a", "w": 480, "h": 640},
-                            {"t_ms": 100, "hash": "b", "w": 480, "h": 640}
-                        ],
-                        "codec": "jpeg-seq"
-                    },
-                    "depth_seq": null,
-                    "ir_seq": null
-                },
-                "sensors": {
-                    "device_caps": {
-                        "platform": "ios",
-                        "has_front_depth": true,
-                        "has_front_ir": true,
-                        "depth_available": true,
-                        "model": "iPhone15,2",
-                        "os": "18.0"
-                    }
-                }
-            },
-            "challenge": {
-                "spec_id": "spec-1",
-                "type": "head_motion",
-                "rendered": [
-                    {"t_ms": 0, "action": "look_up"},
-                    {"t_ms": 900, "action": "blink"}
-                ]
-            },
-            "features": [
-                {
-                    "t_ms": 0,
-                    "yaw": 1.0,
-                    "pitch": 2.0,
-                    "roll": 0.0,
-                    "eye_l": 0.9,
-                    "eye_r": 0.9,
-                    "face_scale": 0.5,
-                    "nose": [0.0, 0.0],
-                    "eye_lp": [0.0, 0.0],
-                    "eye_rp": [0.0, 0.0],
-                    "brightness": -1.0,
-                    "skin": -1.0
-                }
-            ],
-            "dataset": {
-                "session_type": "bona_fide",
-                "pai_species": "none",
-                "consent": {
-                    "verify": true,
-                    "training_use": false,
-                    "version": "v1",
-                    "ts": 1700000000000i64
-                }
-            }
-        })
+    /// One shared vector: the envelope, the byte length of its canonical CBOR,
+    /// and the sha256 of those bytes.
+    fn shared_vector(name: &str) -> (serde_json::Value, usize, String) {
+        let raw = match name {
+            "base" => include_str!("../../vectors/belt/base.json"),
+            "documented" => include_str!("../../vectors/belt/documented.json"),
+            "boundary" => include_str!("../../vectors/belt/boundary.json"),
+            "frame-bound" => include_str!("../../vectors/belt/frame-bound.json"),
+            "depth-bound" => include_str!("../../vectors/belt/depth-bound.json"),
+            other => panic!("no shared vector named {other}"),
+        };
+        let v: serde_json::Value = serde_json::from_str(raw).expect("vector parses");
+        (
+            v["envelope"].clone(),
+            v["cbor_len"].as_u64().expect("cbor_len") as usize,
+            v["sha256"].as_str().expect("sha256").to_string(),
+        )
     }
 
+    /// Every shared vector encodes to the length and hash the file records.
+    ///
+    /// One test over all five rather than one test each: they differ only in
+    /// which fields the envelope carries, and a per-vector test tempts the next
+    /// person to add a vector without a reader.
     #[test]
-    fn belt_envelope_matches_the_shared_test_vector() {
-        let bytes = encode(&Cbor::from_json(&belt_envelope_fixture()).unwrap()).unwrap();
-        let digest = to_hex(&Sha256::digest(&bytes));
-
-        // Byte length and sha256 of the encoding — asserted identically by
-        // app/test/belt_bundle_test.dart against the Dart encoder.
-        assert_eq!(bytes.len(), SHARED_VECTOR_LEN);
-        assert_eq!(digest, SHARED_VECTOR_SHA256);
+    fn every_shared_vector_encodes_to_its_recorded_bytes() {
+        for name in ["base", "documented", "boundary", "frame-bound", "depth-bound"] {
+            let (envelope, len, sha256) = shared_vector(name);
+            let bytes = encode(&Cbor::from_json(&envelope).unwrap()).unwrap();
+            assert_eq!(bytes.len(), len, "{name}: encoded length");
+            assert_eq!(to_hex(&Sha256::digest(&bytes)), sha256, "{name}: sha256");
+        }
     }
-
-    /// Length in bytes of the deterministic-CBOR encoding of the shared fixture.
-    const SHARED_VECTOR_LEN: usize = 740;
-    /// sha256 (lowercase hex) of that encoding.
-    const SHARED_VECTOR_SHA256: &str =
-        "05c0031fce26c6887c4ec84beb757792d03e2bc04643671ccc349dfc5e66cc63";
-
-    /// The same envelope WITH the source-document section (spec §5.1 B): the
-    /// passport evidence named by content hash. This is the shape the DTC flow
-    /// produces today — EF.DG2 is reachable (the ePassport credential's
-    /// always-visible `portrait_hash`), EF.SOD and EF.DG1 are not, so they
-    /// encode as explicit CBOR nulls rather than being dropped.
-    fn belt_envelope_with_documents_fixture() -> serde_json::Value {
-        let mut env = belt_envelope_fixture();
-        env.as_object_mut().unwrap().insert(
-            "documents".into(),
-            json!([{
-                "type": "epassport",
-                "sod_hash": null,
-                "dg1_hash": null,
-                "dg2_hash": "d2"
-            }]),
-        );
-        env
-    }
-
-    #[test]
-    fn belt_envelope_with_documents_matches_the_shared_test_vector() {
-        let bytes =
-            encode(&Cbor::from_json(&belt_envelope_with_documents_fixture()).unwrap()).unwrap();
-        let digest = to_hex(&Sha256::digest(&bytes));
-
-        // Asserted identically by app/test/belt_bundle_test.dart against the
-        // Dart encoder ("canonicalCbor of the documented envelope …").
-        assert_eq!(bytes.len(), DOCUMENTED_VECTOR_LEN);
-        assert_eq!(digest, DOCUMENTED_VECTOR_SHA256);
-    }
-
-    /// Length in bytes of the encoding of the documented fixture.
-    const DOCUMENTED_VECTOR_LEN: usize = 799;
-    /// sha256 (lowercase hex) of that encoding.
-    const DOCUMENTED_VECTOR_SHA256: &str =
-        "177158f4602d356e8268b6026f7827c01b117ae239d1d2b45c21f2e0e13b989d";
-
-    /// The same envelope with its two clock fields pushed to the ends of the
-    /// i64 range — the values a caller can put in `captured_at` / `clock_base`
-    /// and the ones a `-1 - i` encoder gets wrong. Encoding them through the
-    /// whole envelope (rather than as bare integers) is what pins the boundary
-    /// against the device: app/test/belt_bundle_test.dart builds the same
-    /// bundle and asserts this same hash.
-    fn belt_envelope_at_the_integer_boundaries_fixture() -> serde_json::Value {
-        let mut env = belt_envelope_fixture();
-        env["captured_at"] = json!(i64::MAX);
-        env["clock_base"] = json!(i64::MIN);
-        env
-    }
-
-    #[test]
-    fn belt_envelope_at_the_integer_boundaries_matches_the_shared_test_vector() {
-        let bytes =
-            encode(&Cbor::from_json(&belt_envelope_at_the_integer_boundaries_fixture()).unwrap())
-                .unwrap();
-        let digest = to_hex(&Sha256::digest(&bytes));
-
-        assert_eq!(bytes.len(), BOUNDARY_VECTOR_LEN);
-        assert_eq!(digest, BOUNDARY_VECTOR_SHA256);
-    }
-
-    /// Length in bytes of the encoding of the boundary fixture.
-    const BOUNDARY_VECTOR_LEN: usize = 748;
-    /// sha256 (lowercase hex) of that encoding.
-    const BOUNDARY_VECTOR_SHA256: &str =
-        "2d8523a53ea8a53a68d8017c9011a54788f9d5d828fe7a51b1d62a6319ec7dfa";
 }
