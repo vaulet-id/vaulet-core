@@ -458,6 +458,7 @@ pub fn issue_statement(
             // could be withheld is one a verifier cannot read, and the point of
             // it is being read by somebody who was not there.
             disclosable: serde_json::Map::new(),
+            member_disclosable: Default::default(),
             visible,
         },
         key,

@@ -192,6 +192,7 @@ mod tests {
                 exp: NOW + 10_000,
                 holder_jwk: holder.public_jwk().unwrap(),
                 disclosable: Default::default(),
+                member_disclosable: Default::default(),
                 visible: Default::default(),
             },
             key,

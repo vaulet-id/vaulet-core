@@ -471,6 +471,7 @@ pub fn wallet_self_issue(secret: &str, vct: &str, claims_json: &str, iat: i64) -
         exp: iat + 315_360_000, // ~10 years
         holder_jwk,
         disclosable: serde_json::Map::new(),
+        member_disclosable: Default::default(),
         visible,
     };
     credential::issue(params, &key)
@@ -775,6 +776,7 @@ mod tests {
                 exp: 1_700_000_000 + 3600,
                 holder_jwk: identity.public_jwk.clone(),
                 disclosable,
+                member_disclosable: Default::default(),
                 visible: Map::new(),
             },
             &issuer,

@@ -72,6 +72,19 @@ pub struct IssueParams {
     pub holder_jwk: Value,
     /// Z1: selectively-disclosable claims, name -> value.
     pub disclosable: Map<String, Value>,
+    /// Disclosable claims whose **members** are concealed one at a time rather
+    /// than the object as a whole.
+    ///
+    /// An address is the reason this exists (ADR 0031): showing which province
+    /// somebody lives in without their house number is the point of carrying it
+    /// structured at all, and an object concealed whole is worth no more than
+    /// the string it replaced.
+    ///
+    /// Opt-in per claim rather than a rule for every object, because the two
+    /// readings are both defensible and the wrong one is silent: `evidence` is
+    /// an object that means one thing, and splitting it would let a holder
+    /// disclose a verdict without what it was reached from.
+    pub member_disclosable: std::collections::BTreeSet<String>,
     /// Z2: always-visible derived claims, name -> value.
     pub visible: Map<String, Value>,
 }
@@ -151,7 +164,23 @@ pub fn issue(params: IssueParams, issuer_key: &dyn Es256Signer) -> Result<String
     for (k, v) in params.visible {
         claims.insert(k, v);
     }
-    let disclosable_keys: Vec<String> = params.disclosable.keys().cloned().collect();
+    // What gets a disclosure, as JSON pointers. A claim named in
+    // `member_disclosable` contributes one per member instead of one for
+    // itself — `/address/region` rather than `/address`.
+    let mut pointers: Vec<String> = Vec::new();
+    for (name, value) in &params.disclosable {
+        match (params.member_disclosable.contains(name), value.as_object()) {
+            (true, Some(members)) => {
+                for member in members.keys() {
+                    pointers.push(format!("/{name}/{member}"));
+                }
+            }
+            // Named but not an object: there are no members to conceal one at a
+            // time, so it is concealed as itself. Refusing would turn an
+            // address somebody typed as one line into a failed issuance.
+            _ => pointers.push(format!("/{name}")),
+        }
+    }
     for (k, v) in params.disclosable {
         claims.insert(k, v);
     }
@@ -161,10 +190,10 @@ pub fn issue(params: IssueParams, issuer_key: &dyn Es256Signer) -> Result<String
 
     let mut builder = SdJwtBuilder::new(Value::Object(claims))
         .map_err(|e| CoreError::Credential(format!("sd-jwt builder: {e}")))?;
-    for key in &disclosable_keys {
+    for pointer in &pointers {
         builder = builder
-            .make_concealable(&format!("/{key}"))
-            .map_err(|e| CoreError::Credential(format!("make_concealable /{key}: {e}")))?;
+            .make_concealable(pointer)
+            .map_err(|e| CoreError::Credential(format!("make_concealable {pointer}: {e}")))?;
     }
     let signer = ExternalEs256Signer(issuer_key);
     let sd_jwt = pollster::block_on(
@@ -767,6 +796,7 @@ mod status_tests {
             exp: 9_999_999_999,
             holder_jwk: SoftwareKey::generate().public_jwk().unwrap(),
             disclosable: Map::new(),
+            member_disclosable: Default::default(),
             visible: serde_json::from_value(serde_json::json!({
                 "status": { "status_list": { "uri": URI } }
             }))
@@ -786,6 +816,7 @@ mod status_tests {
             exp: 9_999_999_999,
             holder_jwk: SoftwareKey::generate().public_jwk().unwrap(),
             disclosable: Map::new(),
+            member_disclosable: Default::default(),
             visible: Map::new(),
         };
         let sd_jwt = issue(params, &key).unwrap();
@@ -815,6 +846,7 @@ mod tests {
             exp: 1_700_000_000 + 365 * 24 * HOUR,
             holder_jwk: holder.public_jwk().unwrap(),
             disclosable,
+            member_disclosable: Default::default(),
             visible,
         }
     }
@@ -1013,6 +1045,61 @@ mod tests {
         doc.as_object_mut().unwrap().remove("id");
 
         assert!(verify_with_did_document(&sd_jwt, &doc, 1_700_000_000).is_err());
+    }
+
+    /// The reason `member_disclosable` exists (ADR 0031): showing which province
+    /// somebody lives in without their house number. An object concealed whole
+    /// is worth no more than the string it replaced.
+    #[test]
+    fn an_address_discloses_one_member_at_a_time() {
+        let issuer = SoftwareKey::generate();
+        let holder = SoftwareKey::generate();
+
+        let mut params = sample_params(&holder);
+        params.disclosable.insert(
+            "address".into(),
+            json!({
+                "region": "Bangkok",
+                "locality": "Khlong San",
+                "postal_code": "10600",
+                "street_address": "12 Soi Charoen Nakhon 5",
+            }),
+        );
+        params.member_disclosable.insert("address".into());
+        let sd_jwt = issue(params, &issuer).unwrap();
+
+        // Four members, four disclosures — plus whatever the sample already had.
+        let disclosures = sd_jwt.split('~').filter(|s| !s.is_empty()).count() - 1;
+        assert!(disclosures >= 4, "only {disclosures} disclosures");
+
+        // And each one is a member, not the object: a disclosure naming
+        // `address` would be the all-or-nothing shape this replaced.
+        let names: Vec<String> = sd_jwt
+            .split('~')
+            .skip(1)
+            .filter(|s| !s.is_empty())
+            .filter_map(|d| {
+                let raw = B64.decode(d).ok()?;
+                let v: Value = serde_json::from_slice(&raw).ok()?;
+                v.get(1)?.as_str().map(str::to_string)
+            })
+            .collect();
+        assert!(names.contains(&"postal_code".to_string()), "{names:?}");
+        assert!(!names.contains(&"address".to_string()), "{names:?}");
+    }
+
+    /// Named but not an object: there are no members to split, so it is
+    /// concealed as itself. An address somebody typed as one line must issue.
+    #[test]
+    fn a_claim_with_no_members_is_still_concealed() {
+        let issuer = SoftwareKey::generate();
+        let holder = SoftwareKey::generate();
+        let mut params = sample_params(&holder);
+        params
+            .disclosable
+            .insert("address".into(), json!("12 Soi Charoen Nakhon 5, Bangkok"));
+        params.member_disclosable.insert("address".into());
+        assert!(issue(params, &issuer).is_ok());
     }
 
     #[test]
