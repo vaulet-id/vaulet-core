@@ -773,7 +773,7 @@ mod tests {
         let issuer = keys::software::SoftwareKey::generate();
 
         let mut disclosable = Map::new();
-        disclosable.insert("email".into(), json!("somchai@codefin.io"));
+        disclosable.insert("email".into(), json!("somchai@example.com"));
         let sd_jwt = credential::issue(
             credential::IssueParams {
                 vct: "https://issuer.example/credential/verified_email".into(),
@@ -809,7 +809,7 @@ mod tests {
             1_700_000_200,
         )
         .unwrap();
-        assert_eq!(verified.claims["email"], json!("somchai@codefin.io"));
+        assert_eq!(verified.claims["email"], json!("somchai@example.com"));
 
         // Wrong nonce (replay) must be rejected by the verifier.
         assert!(credential::verify_presentation(
