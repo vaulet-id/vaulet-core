@@ -103,3 +103,38 @@ mod tests {
     }
 
 }
+
+// ---------------------------------------------------------------------------
+// Shared with the issuer.
+//
+// The `typ` values are protocol vocabulary: the wallet signs a JWT with one and
+// the issuer refuses anything that does not carry it. Two parties reading one
+// constant is exactly what belongs in this crate — a copy on each side is two
+// constants that agree until one of them does not.
+//
+// `verify_passport_verdict` is here for the same reason, and only its name
+// travelled from the wallet's facade — the issuer verifies chips too, and it is
+// nobody's wallet. It is a shape adapter over `emrtd::verify_passport` for
+// callers holding owned bytes.
+// ---------------------------------------------------------------------------
+
+/// `typ` of the JWT a wallet signs to sign in to Studio.
+pub const STUDIO_SIGNIN_JWT_TYP: &str = "vaulet-studio-signin+jwt";
+/// `typ` of the JWT a wallet signs to connect an external account (ADR 0024).
+pub const SOCIAL_CONNECT_JWT_TYP: &str = "vaulet-connect-account+jwt";
+/// `typ` of the JWT a wallet signs to join an organisation.
+pub const ORG_JOIN_JWT_TYP: &str = "vaulet-org-join+jwt";
+
+/// Passive and Active Authentication over owned bytes, for callers that have
+/// them that way — the wallet across FFI, the issuer out of a request body.
+pub fn verify_passport_verdict(
+    sod: &[u8],
+    dgs: std::collections::BTreeMap<u8, Vec<u8>>,
+    csca: Vec<Vec<u8>>,
+    aa: Option<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+) -> Result<emrtd::PassportVerdict> {
+    let aa_ref = aa
+        .as_ref()
+        .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice()));
+    emrtd::verify_passport(sod, &dgs, &csca, aa_ref)
+}
