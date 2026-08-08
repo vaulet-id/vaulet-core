@@ -78,7 +78,12 @@ const FLAG_DEFAULT_MEDIATOR: u8 = 1 << 0;
 ///
 /// Anyone on any other mediator emits a card that names it in full, which costs
 /// a longer QR and is the only thing that can be right.
-pub const WELL_KNOWN_MEDIATOR: &str = "https://vaulet-mediator.fly.dev";
+///
+/// **A name we own, not the host we rent.** This string is baked into every card
+/// ever scanned, so it has to outlive the machine answering it: a provider's
+/// hostname would make moving off that provider a format change, and cards
+/// already in the world would name somewhere nobody is.
+pub const WELL_KNOWN_MEDIATOR: &str = "https://m.vaulet.id";
 /// `flags` bit 1: a key package follows. Absent in a QR code, present in the
 /// sealed introduction.
 const FLAG_HAS_KEY_PACKAGE: u8 = 1 << 1;
@@ -363,7 +368,7 @@ mod tests {
         "0427a88cbee10bfd805945e934a80abcea2bc0869f6e01221230a3aa21a67aa9f7",
         "a42146f18f72efacac29104f554b239761f5607891765bd2b876bbc0e1322785",
     );
-    const DEFAULT_MEDIATOR: &str = "https://vaulet-mediator.fly.dev";
+    const DEFAULT_MEDIATOR: &str = "https://m.vaulet.id";
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
