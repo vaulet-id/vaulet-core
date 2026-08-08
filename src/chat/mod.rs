@@ -35,6 +35,7 @@ pub use state::{
 };
 
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
+use openmls::prelude::group_info::VerifiableGroupInfo;
 use openmls::prelude::{tls_codec::*, *};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -212,8 +213,53 @@ impl Session {
     /// credential, which is the point where our issuer becomes MLS's
     /// Authentication Service.
     pub fn new(identity: &[u8]) -> Result<Self> {
+        Self::with_signer(identity, SignatureKeyPair::new(SIGNATURE_SCHEME).map_err(mls)?)
+    }
+
+    /// The same session, with the signature key **derived from the wallet
+    /// seed** rather than drawn fresh.
+    ///
+    /// **So that a restored wallet replaces its old seat instead of taking a
+    /// second one.** An external commit removes any member holding the same
+    /// signature key, which is what lets a device that lost its state walk back
+    /// into a room it is already listed in. Drawn fresh, the restored device
+    /// arrives as a stranger and the old leaf stays in the room for good: a
+    /// member nobody can reach, listed under the same name as the person who
+    /// just came back.
+    ///
+    /// This gives up nothing. The seed already unseals the whole chat state —
+    /// including this key, which is stored in it — so anybody holding the seed
+    /// could already speak as this device. What changes is only that the key
+    /// can be recomputed instead of only recovered.
+    ///
+    /// Its own label, so that it cannot collide with an inbox key, a room key
+    /// or the state key, all of which come from the same seed.
+    pub fn new_from_seed(identity: &[u8], seed: &[u8]) -> Result<Self> {
+        let mut scalar = [0u8; 32];
+        hkdf::Hkdf::<sha2::Sha256>::new(None, seed)
+            .expand(b"vaulet/chat/mls-signer/v1", &mut scalar)
+            .map_err(|_| ChatError::Mls("signer key derivation".into()))?;
+        let key = p256::ecdsa::SigningKey::from_slice(&scalar)
+            .map_err(|_| ChatError::Mls("signer scalar out of range".into()))?;
+
+        // The two encodings openmls_basic_credential itself produces for this
+        // scheme — a raw scalar and an uncompressed point — taken from its
+        // `SignatureKeyPair::new` rather than from a reading of the spec.
+        #[allow(deprecated)]
+        let private = key.to_bytes().as_slice().to_vec();
+        let public = key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        Self::with_signer(
+            identity,
+            SignatureKeyPair::from_raw(SIGNATURE_SCHEME, private, public),
+        )
+    }
+
+    fn with_signer(identity: &[u8], signer: SignatureKeyPair) -> Result<Self> {
         let provider = OpenMlsRustCrypto::default();
-        let signer = SignatureKeyPair::new(SIGNATURE_SCHEME).map_err(mls)?;
         signer.store(provider.storage()).map_err(mls)?;
 
         let credential = CredentialWithKey {
@@ -650,6 +696,22 @@ impl Session {
         &self.identity
     }
 
+    /// Members' **signature keys**, in leaf order — what a room info is checked
+    /// against by [`Session::rejoin_from_backup`].
+    ///
+    /// Public by definition: every one of them is in the ratchet tree that
+    /// every member holds. They are here because a recovery file has to carry
+    /// something a restored device can weigh an answer against, and an identity
+    /// is a name anybody can put in a credential while a signature key is what
+    /// actually signed.
+    pub fn member_keys(&self, room_id: &[u8]) -> Result<Vec<Vec<u8>>> {
+        let group = self.load(room_id)?;
+        Ok(group
+            .members()
+            .map(|m| m.signature_key.as_slice().to_vec())
+            .collect())
+    }
+
     /// Members' identities, in leaf order.
     pub fn members(&self, room_id: &[u8]) -> Result<Vec<Vec<u8>>> {
         let group = self.load(room_id)?;
@@ -856,6 +918,81 @@ impl Session {
             }
         }
 
+        self.join_externally(info)
+    }
+
+    /// Let ourselves back into a room we have **no state for at all**.
+    ///
+    /// This is what a restored wallet needs, and it is a different problem from
+    /// [`Chat::rejoin`]. That one is vouched by a member of the group we
+    /// currently hold; here there is no group, because the only thing a
+    /// recovery file carries about a room is who was in it and where to write
+    /// to them. The MLS ratchet is deliberately not in a backup — putting an
+    /// old one back into a live conversation is the desynchronisation that ends
+    /// it — so a restore has to be let back in rather than handed its seat.
+    ///
+    /// **Without a voucher this is not a rejoin, it is an abduction.** A group
+    /// info is self-consistent by construction: it carries the ratchet tree its
+    /// own signature is checked against, so it is evidence of nothing on its
+    /// own. A room inbox is HPKE and anonymous, and everybody who was ever in
+    /// the room keeps every address announced inside it — so a member who was
+    /// removed can answer, or manufacture, an ask. Accepting the first answer
+    /// would let them replace the real room with one of their making and speak
+    /// in it as though it were the room.
+    ///
+    /// So the backup is the trust anchor: it names the signature keys that were
+    /// in the room when it was written, and an answer counts only if one of
+    /// them signed it. An empty list is refused rather than treated as "anyone
+    /// will do", which is the failure mode of every allowlist that defaults to
+    /// open.
+    ///
+    /// It is also refused for a room we still hold, so that a stale backup
+    /// cannot be used to walk into a room the ordinary path is looking after.
+    pub fn rejoin_from_backup(
+        &mut self,
+        room_id: &[u8],
+        room_info: &[u8],
+        vouchers: &[Vec<u8>],
+    ) -> Result<Invitation> {
+        if vouchers.is_empty() {
+            return Err(ChatError::Malformed("no key to vouch for a room info"));
+        }
+        if self.load(room_id).is_ok() {
+            return Err(ChatError::Malformed("already in this room"));
+        }
+
+        let info = MlsMessageIn::tls_deserialize_exact(room_info)
+            .map_err(|_| ChatError::Malformed("room info"))?
+            .extract();
+        let MlsMessageBodyIn::GroupInfo(info) = info else {
+            return Err(ChatError::Malformed("not a room info"));
+        };
+
+        // **The room we asked about, not whichever one the answer names.** The
+        // ordinary path loads the group the info names and is safe because that
+        // load is what fails for a room we are not in; there is no such load
+        // here, so an answer for another room would otherwise be joined.
+        if info.group_id().as_slice() != room_id {
+            return Err(ChatError::Malformed("room info for another room"));
+        }
+
+        let scheme = CIPHERSUITE.signature_algorithm();
+        let crypto = self.provider.crypto();
+        let vouched = vouchers.iter().find_map(|key| {
+            let key = OpenMlsSignaturePublicKey::new(key.clone().into(), scheme).ok()?;
+            info.clone().verify(crypto, &key).ok()
+        });
+        if vouched.is_none() {
+            return Err(ChatError::Malformed("room info from outside the room"));
+        }
+
+        self.join_externally(info)
+    }
+
+    /// The external commit itself, shared by both ways back into a room. Which
+    /// of them a caller used decides what vouched for the group info; from here
+    /// on the two are the same operation.
+    fn join_externally(&mut self, info: VerifiableGroupInfo) -> Result<Invitation> {
         let (mut group, commit, _) = MlsGroup::join_by_external_commit(
             &self.provider,
             &self.signer,
@@ -1600,6 +1737,180 @@ mod tests {
                 .all(|m| m != b"did:peer:carol"),
             "the refused answer must not have moved this device anywhere"
         );
+    }
+
+    /// **A wallet restored onto a new phone gets its rooms back.**
+    ///
+    /// The MLS ratchet is deliberately not in a recovery file — putting an old
+    /// one back into a live conversation is the desynchronisation that ends it
+    /// — so a restore holds no group state at all, and the ordinary rejoin
+    /// cannot help: it weighs an answer against the group it already has, and
+    /// there is none. What the file does carry is who was in the room, and that
+    /// is enough to tell a real answer from a manufactured one.
+    #[test]
+    fn a_wallet_with_no_state_at_all_can_be_let_back_into_its_rooms() {
+        let seed = [7u8; 64];
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        let room = alice.create_room().unwrap();
+        let invitation = alice
+            .add_member(&room, &bob.key_package().unwrap())
+            .unwrap();
+        bob.join(&invitation.welcome).unwrap();
+
+        // What the recovery file would have been written from, while the wallet
+        // still worked.
+        let vouchers = bob.member_keys(&room).unwrap();
+
+        // The new phone: the same seed, and nothing else.
+        let mut restored = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        assert!(
+            restored.epoch(&room).is_err(),
+            "a restored wallet must genuinely hold nothing, or this proves nothing"
+        );
+
+        let info = alice.room_info(&room).unwrap();
+        let back = restored
+            .rejoin_from_backup(&room, &info, &vouchers)
+            .expect("a room info vouched by the backup was refused");
+        alice.receive(&back.commit).unwrap();
+
+        let after = alice.send(&room, b"welcome back").unwrap();
+        match restored.receive(&after).unwrap() {
+            Received::Application { plaintext, .. } => {
+                assert_eq!(plaintext, b"welcome back");
+            }
+            other => panic!("the restored wallet is still outside: {other:?}"),
+        }
+
+        // **And it took its old seat rather than a second one.** A signature
+        // key drawn fresh would have left the leaf it replaced sitting in the
+        // room for good — a member nobody can reach, listed under the same name
+        // as the person who just came back.
+        assert_eq!(
+            alice
+                .members(&room)
+                .unwrap()
+                .iter()
+                .filter(|m| m.as_slice() == b"did:peer:bob")
+                .count(),
+            1,
+            "the room is holding the restored device twice"
+        );
+    }
+
+    /// **Without a voucher a room info is evidence of nothing.** It carries the
+    /// ratchet tree its own signature is checked against, and a room inbox is
+    /// anonymous — everybody who was ever in the room keeps every address
+    /// announced inside it. So somebody removed from the room can answer an ask
+    /// with a group of their own making, and a device with no state has nothing
+    /// of its own to weigh that against.
+    #[test]
+    fn a_restored_wallet_refuses_a_room_info_the_backup_does_not_vouch_for() {
+        let seed = [8u8; 64];
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        let room = alice.create_room().unwrap();
+        let invitation = alice
+            .add_member(&room, &bob.key_package().unwrap())
+            .unwrap();
+        bob.join(&invitation.welcome).unwrap();
+
+        // Carol joins and is taken out, so she keeps a live group with this
+        // room's id — which is exactly the state an attacker has.
+        let mut carol = Session::new(b"did:peer:carol").unwrap();
+        let adding = alice
+            .add_member(&room, &carol.key_package().unwrap())
+            .unwrap();
+        bob.receive(&adding.commit).unwrap();
+        carol.join(&adding.welcome).unwrap();
+        let removing = alice.remove_member(&room, b"did:peer:carol").unwrap();
+        bob.receive(&removing).unwrap();
+
+        // The backup was written after she went, so her key is not in it.
+        let vouchers = bob.member_keys(&room).unwrap();
+        let mut restored = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        let hers = carol.room_info(&room).unwrap();
+        assert_eq!(
+            Session::room_in_group_info(&hers).unwrap(),
+            room,
+            "the blob has to name the real room, or this proves nothing"
+        );
+        assert!(
+            restored.rejoin_from_backup(&room, &hers, &vouchers).is_err(),
+            "a room of somebody else's making was walked into"
+        );
+
+        // And the honest answer still works, so the refusal above is about who
+        // signed rather than about the shape of the blob.
+        let honest = alice.room_info(&room).unwrap();
+        assert!(restored.rejoin_from_backup(&room, &honest, &vouchers).is_ok());
+    }
+
+    /// An empty list is refused rather than read as "anybody will do", which is
+    /// how every allowlist that defaults to open fails.
+    #[test]
+    fn a_restored_wallet_with_nobody_to_vouch_refuses_rather_than_accepts() {
+        let seed = [11u8; 64];
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        let room = alice.create_room().unwrap();
+        let invitation = alice
+            .add_member(&room, &bob.key_package().unwrap())
+            .unwrap();
+        bob.join(&invitation.welcome).unwrap();
+
+        let info = alice.room_info(&room).unwrap();
+        let mut restored = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        assert!(restored.rejoin_from_backup(&room, &info, &[]).is_err());
+    }
+
+    /// A room info names its own room, and a device with no state cannot tell
+    /// from the outside whether that is the room it asked about. The ordinary
+    /// path is safe because it loads the group the blob names; there is no such
+    /// load here.
+    #[test]
+    fn a_restored_wallet_refuses_an_answer_about_a_different_room() {
+        let seed = [12u8; 64];
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+
+        let one = alice.create_room().unwrap();
+        let first = alice.add_member(&one, &bob.key_package().unwrap()).unwrap();
+        bob.join(&first.welcome).unwrap();
+        let two = alice.create_room().unwrap();
+        let second = alice.add_member(&two, &bob.key_package().unwrap()).unwrap();
+        bob.join(&second.welcome).unwrap();
+
+        let vouchers = bob.member_keys(&one).unwrap();
+        let about_the_other = alice.room_info(&two).unwrap();
+
+        let mut restored = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        assert!(
+            restored
+                .rejoin_from_backup(&one, &about_the_other, &vouchers)
+                .is_err(),
+            "an answer about another room was joined as though it were this one"
+        );
+    }
+
+    /// A stale recovery file must not be a way into a room the ordinary path is
+    /// already looking after — that road has its own rules, and they are
+    /// stricter.
+    #[test]
+    fn a_backup_cannot_be_used_to_walk_into_a_room_we_are_already_in() {
+        let seed = [13u8; 64];
+        let mut alice = Session::new(b"did:peer:alice").unwrap();
+        let mut bob = Session::new_from_seed(b"did:peer:bob", &seed).unwrap();
+        let room = alice.create_room().unwrap();
+        let invitation = alice
+            .add_member(&room, &bob.key_package().unwrap())
+            .unwrap();
+        bob.join(&invitation.welcome).unwrap();
+
+        let vouchers = bob.member_keys(&room).unwrap();
+        let info = alice.room_info(&room).unwrap();
+        assert!(bob.rejoin_from_backup(&room, &info, &vouchers).is_err());
     }
 
     /// **A member whose ratchet has fallen behind lets themselves back in**,
