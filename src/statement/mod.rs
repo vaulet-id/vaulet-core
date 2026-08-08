@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   symbol   {"act":"guarantee","cap":"500000","ccy":"THB", …}
-//!   text     "ข้าพเจ้าค้ำประกันวงเงินไม่เกิน 500,000 บาท"
+//!   text     "I guarantee an amount not exceeding 500,000 THB"
 //! ```
 //!
 //! The **symbol is for the app**: it decides what is rendered, what a rule can
@@ -217,7 +217,7 @@ impl Template {
     ///
     /// A placeholder with no value is an error rather than an empty space: the
     /// whole point of the text is that it says what the symbol says, and
-    /// "ค้ำประกันวงเงินไม่เกิน  บาท" says something else.
+    /// "I guarantee an amount not exceeding  THB" says something else.
     pub fn render(&self, lang: &str, fields: &BTreeMap<String, String>) -> Result<String> {
         let wording = self
             .wording
@@ -338,8 +338,9 @@ impl Statement {
         // A displayed date beside a timestamp would be two spellings of one
         // fact — the exact pair this whole design exists to refuse — so the
         // sentence renders whatever is in the field, verbatim, and the field is
-        // a date anybody can compare. A sentence reading "ถึงวันที่ 2031-09-05"
-        // is less graceful than one reading "5 กันยายน 2574"; a localised date
+        // a date anybody can compare. A sentence reading "until 2031-09-05"
+        // is less graceful than one naming the month in the reader's own
+        // calendar and language; a localised date
         // is a new template version, which is the mechanism already here for
         // changing wording, and not a change to the renderer.
         //
