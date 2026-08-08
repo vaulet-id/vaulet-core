@@ -16,7 +16,7 @@ categories = ["cryptography", "authentication"]
 # cargo requires one, and it does not promise anything — see README, Stability.
 
 [lib]
-crate-type = ["lib", "staticlib", "cdylib"]
+crate-type = ["lib"]
 
 [features]
 # Expose `emrtd::fixtures` (synthetic CSCA/DSC/SOD builders) to downstream test
@@ -79,6 +79,18 @@ openmls_basic_credential = "0.5.0"
 openmls_traits = "0.5.0"
 hkdf = "0.12"
 flate2 = "1.1.9"
+
+# WebAssembly is how the rule in ADR 0033 stops being a document and starts
+# being a compiler error. `getrandom` needs telling that the browser is its
+# entropy source; everything after that fails only if this crate has learned
+# something about one of its callers — a filesystem, a screen, a storage layout.
+# None of that survives a browser, which is exactly why the target is the wall.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+# OpenMLS refuses to build for wasm without being told where randomness and the
+# clock come from, and says so in a compile_error rather than failing at run
+# time — the right way round for something a group's forward secrecy rests on.
+openmls = { version = "0.8", features = ["js"] }
 
 [dev-dependencies]
 tempfile = "3"

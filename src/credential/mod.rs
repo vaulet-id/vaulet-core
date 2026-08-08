@@ -129,7 +129,13 @@ impl Es256Signer for SoftwareKey {
 /// signature.
 struct ExternalEs256Signer<'a>(&'a dyn Es256Signer);
 
-#[async_trait::async_trait]
+// `sd_jwt_payload`'s trait is `?Send` on wasm32, where there is one thread and
+// nothing to send a future between, and `Send` everywhere else. The attribute
+// has to match the trait it implements or the two disagree about the future's
+// bounds — which is a compile error, and the right one: the alternative is a
+// crate that quietly builds for a target it cannot run on.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl JwsSigner for ExternalEs256Signer<'_> {
     type Error = String;
     async fn sign(

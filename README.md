@@ -54,15 +54,19 @@ Two things in here do not belong in a library that knows nothing about its
 callers, and are recorded rather than hidden:
 
 - **`lib.rs` carries the wallet's FFI facade** — 22 `wallet_*` functions shaped
-  around one application's screens, nine of which take a `storage_dir` and read
-  and write real files. They are moving to the application that needs them.
+  around one application's screens. The four that read and wrote real files have
+  left; the rest are shaped by one caller and still here.
 - **Some templates carry Thai wording.** The statement layer's whole point is
   that a person signs a sentence they can read, so the wording is bilingual data
   rather than a hardcoded string — but a country's legal phrasing is product,
   not protocol, and it is leaving the crate with the facade.
 
-Neither affects a consumer that does not call them. Both are why the filesystem
-functions fail to compile for `wasm32-unknown-unknown` today.
+Neither affects a consumer that does not call them.
+
+**The crate builds for `wasm32-unknown-unknown`, and CI keeps it that way.** A
+browser has no filesystem and no storage layout, so the target refuses anything
+that has learned about one of its callers — which is the rule above, enforced by
+a compiler rather than by remembering it.
 
 ## Building
 

@@ -99,37 +99,6 @@ pub fn wallet_generate_secret() -> Result<String> {
     mnemonic::generate()
 }
 
-/// Read a legacy PLAINTEXT wallet secret left by a pre-Keychain build, for a
-/// one-time migration into the Keychain: the seed-first mnemonic file if present,
-/// else the Approach-A raw-key jwk. `None` when there is nothing to migrate.
-/// After the caller stores the returned secret in the Keychain it should call
-/// [`wallet_reset`] to delete these files.
-pub fn read_legacy_secret(storage_dir: &str) -> Option<String> {
-    for name in ["wallet_mnemonic.txt", "wallet_key.jwk"] {
-        let p = std::path::Path::new(storage_dir).join(name);
-        if let Ok(s) = std::fs::read_to_string(&p) {
-            let s = s.trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
-        }
-    }
-    None
-}
-
-/// Delete on-device wallet artifacts on reset: the phrase-lock marker and any
-/// legacy plaintext key/seed files from pre-Keychain builds. The Keychain secret
-/// itself is cleared by the platform side (Dart).
-pub fn wallet_reset(storage_dir: &str) -> Result<()> {
-    for name in ["phrase_locked", "wallet_key.jwk", "wallet_mnemonic.txt"] {
-        let p = std::path::Path::new(storage_dir).join(name);
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(|e| CoreError::Key(format!("delete {name}: {e}")))?;
-        }
-    }
-    Ok(())
-}
-
 /// Encrypt the wallet secret into a passphrase-protected recovery file (M1 backup). Seed-first backups carry the mnemonic so a restore
 /// re-derives every facility (ADR 0008); legacy backups carry the raw jwk.
 pub fn wallet_export_backup(secret: &str, passphrase: &str) -> Result<String> {
@@ -231,25 +200,6 @@ pub fn wallet_reveal_phrase(secret: &str) -> Result<String> {
     }
     let key = keys::software::SoftwareKey::from_jwk(s)?;
     mnemonic::encode_key(&key.to_scalar_bytes()) // legacy scalar → Approach-A phrase
-}
-
-/// Whether phrase reveal is permanently locked on this device — a NON-secret
-/// policy marker (the secret lives in the Keychain, untouched). This is the
-/// policy seam: hardware-key and org-policy gates grow here (see [`lock_phrase`]).
-pub fn is_phrase_locked(storage_dir: &str) -> bool {
-    std::path::Path::new(storage_dir)
-        .join("phrase_locked")
-        .exists()
-}
-
-/// Permanently disable revealing the recovery phrase on this device, once the
-/// user has written it down. Irreversible until [`wallet_reset`]. Touches only a
-/// non-secret marker file — the secret is never read or written here.
-pub fn lock_phrase(storage_dir: &str) -> Result<()> {
-    std::fs::create_dir_all(storage_dir)
-        .map_err(|e| CoreError::Key(format!("create storage dir: {e}")))?;
-    let marker = std::path::Path::new(storage_dir).join("phrase_locked");
-    std::fs::write(&marker, b"1").map_err(|e| CoreError::Key(format!("lock phrase: {e}")))
 }
 
 /// The 32-byte BIP39 entropy behind a seed-first mnemonic — the secret Shamir
@@ -723,17 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn phrase_lock_marker_roundtrips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_str().unwrap();
-        assert!(!is_phrase_locked(path));
-        lock_phrase(path).unwrap();
-        assert!(is_phrase_locked(path));
-        wallet_reset(path).unwrap();
-        assert!(!is_phrase_locked(path)); // reset clears the lock
-    }
-
-    #[test]
     fn legacy_jwk_secret_still_works() {
         // A legacy Approach-A wallet stores a raw-key jwk as its secret.
         let key = keys::software::SoftwareKey::generate();
@@ -743,18 +682,6 @@ mod tests {
         // Reveal returns the Approach-A phrase encoding (24 words), no panic.
         let phrase = wallet_reveal_phrase(&jwk).unwrap();
         assert_eq!(phrase.split_whitespace().count(), 24);
-    }
-
-    #[test]
-    fn read_legacy_secret_prefers_mnemonic_then_jwk() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path();
-        let p = path.to_str().unwrap();
-        assert!(read_legacy_secret(p).is_none());
-        std::fs::write(path.join("wallet_key.jwk"), "jwk-content").unwrap();
-        assert_eq!(read_legacy_secret(p).as_deref(), Some("jwk-content"));
-        std::fs::write(path.join("wallet_mnemonic.txt"), "seed words").unwrap();
-        assert_eq!(read_legacy_secret(p).as_deref(), Some("seed words"));
     }
 
     #[test]

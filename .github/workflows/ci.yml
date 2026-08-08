@@ -1,0 +1,33 @@
+# The rule this crate is held to is that it does not know who is calling it
+# (ADR 0033). A rule in a document is argued with; this one compiles.
+#
+# `wasm32-unknown-unknown` is the wall. A browser has no filesystem, no screen
+# and no storage layout, so there is no way to write "the core knows where the
+# app keeps its files" that survives the target. The check does not need to know
+# what the rule says — anything that breaks it stops building here.
+#
+# No `fmt --check` and no `clippy -D warnings`: both have findings that predate
+# this workflow, and a gate that is red on the day it lands teaches everyone to
+# ignore the red. Add them in the commit that clears them.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --all-features
+
+  # Its own job so a failure is legible from the job name rather than having to
+  # be read out of a log.
+  does-not-know-its-callers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo check --target wasm32-unknown-unknown
