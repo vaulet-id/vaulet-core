@@ -69,7 +69,7 @@ pub fn read(
         Some(_) => return Err(CoreError::Credential("vouching is not a string".into())),
     };
 
-    let payload = verify_against_pinned(jws, voucher_doc, pinned)?;
+    let payload = verify_by_pinned_key(jws, voucher_doc, pinned)?;
 
     // Whose word is being read. Without this the statement is one Vaulet made
     // about somebody else, lifted into a document it was not written for.
@@ -121,9 +121,13 @@ pub fn read(
     }))
 }
 
-/// Verify the statement against a voucher key that is both published and
-/// pinned, and return its payload.
-fn verify_against_pinned(jws: &str, voucher_doc: &Value, pinned: &[String]) -> Result<Value> {
+/// Verify a compact JWS against a Vaulet key that is both published and pinned,
+/// and return its payload.
+///
+/// Shared with `crate::address`, which has the same question about a different
+/// artefact: is this ours, and is the key one this build already trusts. Two
+/// copies of a signature check is two chances to disagree about what counts.
+pub(crate) fn verify_by_pinned_key(jws: &str, voucher_doc: &Value, pinned: &[String]) -> Result<Value> {
     let methods = voucher_doc
         .get("verificationMethod")
         .and_then(Value::as_array)
@@ -156,7 +160,7 @@ fn verify_against_pinned(jws: &str, voucher_doc: &Value, pinned: &[String]) -> R
     Err(CoreError::Credential(if tried == 0 {
         "no key Vaulet publishes is one this wallet pins".into()
     } else {
-        "the vouching was not signed by a key this wallet pins".into()
+        "it was not signed by a key this wallet pins".into()
     }))
 }
 
