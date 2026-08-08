@@ -61,24 +61,17 @@ const VERSION: u8 = 4;
 /// spends four bytes saying what the version already says.
 const POINT_LEN: usize = 33;
 
-/// `flags` bit 0: the mediator is the default one, and its URL is omitted.
-/// A card for any other mediator still spells it out — the flag compresses the
-/// common case without making the uncommon one unrepresentable.
-const FLAG_DEFAULT_MEDIATOR: u8 = 1 << 0;
-
-/// The one mediator a card may refer to without naming it.
+/// `flags` bit 0 is unused. It used to mean "the mediator is the well-known one,
+/// and its URL is omitted", with the URL held in a constant here — which put one
+/// deployment's hostname inside a library that is not supposed to know who is
+/// calling it. A card is now always explicit about where its holder is reachable.
 ///
-/// **A constant, and not a parameter, because it is a compression dictionary
-/// rather than a policy.** It used to be passed in as "the default", which the
-/// encoder read as *the sender's* and the decoder as *the reader's* — two
-/// different values for anybody running their own mediator. Two people with
-/// different defaults then disagreed about where a third was reachable, and
-/// deposits are answered identically whether or not anybody is there, so
-/// messages went to an inbox on the wrong machine with nobody told anything.
-///
-/// Anyone on any other mediator emits a card that names it in full, which costs
-/// a longer QR and is the only thing that can be right.
-pub const WELL_KNOWN_MEDIATOR: &str = "https://vaulet-mediator.fly.dev";
+/// Not a parameter, either. As "the default" it was read by the encoder as the
+/// *sender's* and by the decoder as the *reader's*, so two people on different
+/// mediators disagreed about where a third was reachable — and a deposit is
+/// answered identically whether or not anybody is there, so messages went to an
+/// inbox on the wrong machine with nobody told anything. Thirty-odd characters
+/// of QR is the cheaper side of that trade.
 /// `flags` bit 1: a key package follows. Absent in a QR code, present in the
 /// sealed introduction.
 const FLAG_HAS_KEY_PACKAGE: u8 = 1 << 1;
@@ -215,15 +208,11 @@ fn take<'a>(bytes: &mut &'a [u8]) -> Result<&'a [u8]> {
 
 /// Encode for display as a QR code or a link.
 ///
-/// A card for [`WELL_KNOWN_MEDIATOR`] carries one bit instead of a URL, which
-/// is most of what separates a code you have to hold still for from one that
-/// reads at a glance. Every other mediator is named in full — see the constant
-/// for why that is not negotiable.
+/// The mediator is always named in full: which one a wallet uses is the
+/// application's choice, and a library that shortened one particular host would
+/// be choosing for it.
 pub fn encode(invitation: &Invitation) -> Result<String> {
     let mut flags = 0u8;
-    if invitation.mediator == WELL_KNOWN_MEDIATOR {
-        flags |= FLAG_DEFAULT_MEDIATOR;
-    }
     if invitation.has_key_package {
         flags |= FLAG_HAS_KEY_PACKAGE;
     }
@@ -236,9 +225,7 @@ pub fn encode(invitation: &Invitation) -> Result<String> {
     }
 
     let mut body = vec![VERSION, flags];
-    if flags & FLAG_DEFAULT_MEDIATOR == 0 {
-        put(&mut body, invitation.mediator.as_bytes());
-    }
+    put(&mut body, invitation.mediator.as_bytes());
     body.extend_from_slice(&compress(&invitation.inbox_public_key)?);
     body.extend_from_slice(&compress(&invitation.envelope_public_key)?);
     if invitation.has_key_package {
@@ -298,12 +285,8 @@ pub fn decode(text: &str) -> Result<Invitation> {
         .split_first()
         .ok_or(ChatError::Malformed("invitation flags"))?;
 
-    let mediator = if flags & FLAG_DEFAULT_MEDIATOR != 0 {
-        WELL_KNOWN_MEDIATOR.to_string()
-    } else {
-        String::from_utf8(take(&mut rest)?.to_vec())
-            .map_err(|_| ChatError::Malformed("invitation mediator"))?
-    };
+    let mediator = String::from_utf8(take(&mut rest)?.to_vec())
+        .map_err(|_| ChatError::Malformed("invitation mediator"))?;
 
     let inbox_public_key = decompress(take_point(&mut rest)?)?;
     let envelope_public_key = decompress(take_point(&mut rest)?)?;
@@ -363,7 +346,7 @@ mod tests {
         "0427a88cbee10bfd805945e934a80abcea2bc0869f6e01221230a3aa21a67aa9f7",
         "a42146f18f72efacac29104f554b239761f5607891765bd2b876bbc0e1322785",
     );
-    const DEFAULT_MEDIATOR: &str = "https://vaulet-mediator.fly.dev";
+    const DEFAULT_MEDIATOR: &str = "https://mediator.example";
 
     fn hex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -452,7 +435,10 @@ mod tests {
         })
         .unwrap();
 
-        assert!(bare.len() < 110, "the bare card stays tiny: {}", bare.len());
+        // 110 before the mediator was always spelled out; the URL is the whole
+        // difference. Still a QR that reads at a glance — the ceiling below is
+        // the one that matters, because it is the one tied to a QR version.
+        assert!(bare.len() < 150, "the bare card stays tiny: {}", bare.len());
         assert!(
             named.len() < 240,
             "a named card stays inside QR version 9: {}",
@@ -497,14 +483,14 @@ mod tests {
     /// A card read by a build pointing somewhere else must not silently inherit
     /// that build's mediator for a sender who never chose it.
     #[test]
-    fn a_default_flagged_card_resolves_to_the_well_known_one() {
+    fn a_card_resolves_to_the_mediator_it_names() {
         // **This test used to assert the opposite**, and that is why the bug
         // lived: it said a flagged card resolves to *the reader's* default,
         // which is a different machine for anybody running their own. The
         // sender is describing where they are, not asking the reader where they
-        // themselves are.
+        // themselves are. There is no flag now, and nothing left to inherit.
         let text = encode(&card()).unwrap();
-        assert_eq!(decode(&text).unwrap().mediator, WELL_KNOWN_MEDIATOR);
+        assert_eq!(decode(&text).unwrap().mediator, card().mediator);
     }
 
     #[test]
@@ -556,7 +542,8 @@ mod tests {
 
     #[test]
     fn trailing_junk_is_refused() {
-        let mut body = vec![VERSION, FLAG_DEFAULT_MEDIATOR];
+        let mut body = vec![VERSION, 0];
+        put(&mut body, b"https://mediator.example");
         body.extend_from_slice(&compress(&hex(POINT_A)).unwrap());
         body.extend_from_slice(&compress(&hex(POINT_A)).unwrap());
         body.extend_from_slice(b"extra");
@@ -614,8 +601,12 @@ mod tests {
     #[test]
     fn a_card_stays_short_whatever_the_introduction_carries() {
         let card = encode(&card()).unwrap();
+        // Was 120 while a card for one known mediator carried a bit instead of
+        // a URL. That compression put a deployment's hostname in this library,
+        // so it is gone and every card names its mediator; this ceiling is the
+        // budget that replaced it.
         assert!(
-            card.len() < 120,
+            card.len() < 150,
             "the card grew to {} characters",
             card.len()
         );
@@ -662,15 +653,15 @@ mod tests {
             "a named mediator must survive being read by anybody"
         );
 
-        // And the compressed case: a card for the well-known one reads as the
-        // well-known one, not as whatever the reader happens to use.
-        let default = Invitation {
-            mediator: WELL_KNOWN_MEDIATOR.into(),
+        // And a second host, to show nothing is special-cased: whatever the
+        // card names is what comes back out of it.
+        let other = Invitation {
+            mediator: "https://mediator.example".into(),
             ..card()
         };
         assert_eq!(
-            decode(&encode(&default).unwrap()).unwrap().mediator,
-            WELL_KNOWN_MEDIATOR
+            decode(&encode(&other).unwrap()).unwrap().mediator,
+            "https://mediator.example"
         );
     }
 }
