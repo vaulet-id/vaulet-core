@@ -1,7 +1,6 @@
 {
-  "cbor_len": 799,
+  "cbor_len": 802,
   "envelope": {
-    "belt_version": "2.0",
     "capture": {
       "media": {
         "depth_seq": null,
@@ -35,6 +34,7 @@
         }
       }
     },
+    "capture_version": "3.0",
     "captured_at": 1700000000000,
     "challenge": {
       "rendered": [
@@ -100,5 +100,5 @@
   },
   "name": "documented",
   "note": "Plus the source-document section (spec 5.1 B): DG2 reachable, EF.SOD and EF.DG1 explicit nulls.",
-  "sha256": "177158f4602d356e8268b6026f7827c01b117ae239d1d2b45c21f2e0e13b989d"
+  "sha256": "10cf6765f6ccf58caf3aa82ad6e52d3f93a6301ef36de5b49172d3df6425f290"
 }

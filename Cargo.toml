@@ -8,6 +8,12 @@ description = "Vaulet identity core: keys, DIDs, credentials, OID4VC protocol (P
 # (ADR 0032). It grants nothing to the rest of the repository, which stays all
 # rights reserved.
 license = "Apache-2.0"
+repository = "https://github.com/vaulet-id/vaulet-core"
+readme = "README.md"
+keywords = ["did", "verifiable-credentials", "sd-jwt", "emrtd", "wallet"]
+categories = ["cryptography", "authentication"]
+# Consumed by git revision, not from crates.io. The version is here because
+# cargo requires one, and it does not promise anything — see README, Stability.
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]

@@ -1,7 +1,6 @@
 {
-  "cbor_len": 965,
+  "cbor_len": 968,
   "envelope": {
-    "belt_version": "2.0",
     "capture": {
       "media": {
         "depth_seq": {
@@ -67,6 +66,7 @@
         }
       }
     },
+    "capture_version": "3.0",
     "captured_at": 1700000000000,
     "challenge": {
       "rendered": [
@@ -132,5 +132,5 @@
   },
   "name": "depth-bound",
   "note": "Plus the depth sequence and its intrinsics.",
-  "sha256": "16e323ae1c60d8eeea4d75d99335bfaf13d117d4e3a9b534b047bb38a748e93d"
+  "sha256": "1f55d2aea456043e2b55deabe787e13fde48ee849504b69d1a481fe75ec1fef3"
 }

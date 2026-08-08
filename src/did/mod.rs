@@ -1,4 +1,4 @@
-//! DID layer (PLAN.md D4)
+//! DID layer
 //! - holder binding: did:jwk
 //! - chat peers (phase M2): did:peer
 //! - issuers: did:web — the resolver must stay pluggable

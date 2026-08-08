@@ -1,4 +1,4 @@
-//! Credential layer (PLAN.md D2, D13).
+//! Credential layer.
 //! Stored format-agnostic: SD-JWT VC first, dual-rail with BBS+ later (Z3).
 //!
 //! SD-JWT VC / KB-JWT mechanics run on `sd-jwt-payload` (ADR 0004) with

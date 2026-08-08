@@ -1,7 +1,6 @@
 {
-  "cbor_len": 812,
+  "cbor_len": 815,
   "envelope": {
-    "belt_version": "2.0",
     "capture": {
       "media": {
         "depth_seq": null,
@@ -39,6 +38,7 @@
         }
       }
     },
+    "capture_version": "3.0",
     "captured_at": 1700000000000,
     "challenge": {
       "rendered": [
@@ -104,5 +104,5 @@
   },
   "name": "frame-bound",
   "note": "Plus the hashes of the JPEGs the capture uploads, which is what the credential path sends.",
-  "sha256": "92e7853826a2c7aea776d5674a383b33104549d5d98a6ce2d07e27e8005c979a"
+  "sha256": "4dd8a71a4ca540b093316237a8a07a3a173daca20427e3949ae6f655cfac5e58"
 }

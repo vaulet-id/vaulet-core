@@ -308,7 +308,7 @@ mod tests {
 
     /// Cross-multiplying, in the cases where a decimal and a rounding rule
     /// would be argued about. Pinned rather than derived: these are the answers
-    /// Thai company law gives for "ไม่น้อยกว่าสองในสาม" of each size.
+    /// Thai company law gives for "not fewer than two thirds" of each size.
     #[test]
     fn two_thirds_needs_the_numbers_the_law_gives() {
         for (size, needed) in [(1, 1), (2, 2), (3, 2), (4, 3), (5, 4), (6, 4), (7, 5)] {

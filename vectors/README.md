@@ -36,7 +36,7 @@ A vector is only worth anything if it is an **independent witness**. So:
   makes one fail, find out which side is wrong. A regenerated vector proves only
   that the code agrees with itself.
 - A vector changes only when the *format* deliberately changes — and then
-  `belt_version` changes with it, and the old vector is kept beside the new one
+  `capture_version` changes with it, and the old vector is kept beside the new one
   rather than edited.
 
 ## Adding one

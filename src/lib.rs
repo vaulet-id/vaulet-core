@@ -1,4 +1,4 @@
-//! Vaulet identity core — structured per PLAN.md D2–D5.
+//! Vaulet identity core: keys, DIDs, credentials, and the protocols over them.
 //!
 //! Principle: everything touching keys/credentials/protocols lives in this
 //! crate. Flutter is UI only, calling in over FFI (flutter_rust_bridge).
@@ -130,8 +130,7 @@ pub fn wallet_reset(storage_dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Encrypt the wallet secret into a passphrase-protected recovery file (M1
-/// backup, PLAN.md D3). Seed-first backups carry the mnemonic so a restore
+/// Encrypt the wallet secret into a passphrase-protected recovery file (M1 backup). Seed-first backups carry the mnemonic so a restore
 /// re-derives every facility (ADR 0008); legacy backups carry the raw jwk.
 pub fn wallet_export_backup(secret: &str, passphrase: &str) -> Result<String> {
     recovery::encrypt_backup(secret.trim(), passphrase)
@@ -163,7 +162,7 @@ pub struct Vault {
     pub contents: String,
 }
 
-/// Encrypt the wallet **and what it holds** into one recovery file (PLAN.md D3).
+/// Encrypt the wallet **and what it holds** into one recovery file.
 ///
 /// A seed restores an identity. It does not restore credentials: those were
 /// issued to it, are held only on the device, and are gone when the app is

@@ -1,7 +1,6 @@
 {
-  "cbor_len": 740,
+  "cbor_len": 743,
   "envelope": {
-    "belt_version": "2.0",
     "capture": {
       "media": {
         "depth_seq": null,
@@ -35,6 +34,7 @@
         }
       }
     },
+    "capture_version": "3.0",
     "captured_at": 1700000000000,
     "challenge": {
       "rendered": [
@@ -92,5 +92,5 @@
   },
   "name": "base",
   "note": "The capture envelope with no document, no uploaded frames and no depth.",
-  "sha256": "05c0031fce26c6887c4ec84beb757792d03e2bc04643671ccc349dfc5e66cc63"
+  "sha256": "6a29034adf32404cf049dfb738addaff7d93b1822ca6da01b0d21fd814290798"
 }

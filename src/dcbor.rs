@@ -1,4 +1,4 @@
-//! Deterministic CBOR — the frozen `belt_v1` canonicalization (RFC 8949 §4.2).
+//! Deterministic CBOR — the frozen `capture_v1` canonicalization (RFC 8949 §4.2).
 //!
 //! This is how the capture layer bundle is hashed (see
 //! `app/lib/features/capture/capture_bundle.dart`), and this module is the

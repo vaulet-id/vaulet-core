@@ -1,7 +1,6 @@
 {
-  "cbor_len": 748,
+  "cbor_len": 751,
   "envelope": {
-    "belt_version": "2.0",
     "capture": {
       "media": {
         "depth_seq": null,
@@ -35,6 +34,7 @@
         }
       }
     },
+    "capture_version": "3.0",
     "captured_at": 9223372036854775807,
     "challenge": {
       "rendered": [
@@ -92,5 +92,5 @@
   },
   "name": "boundary",
   "note": "The clock fields at both ends of the i64 range - the values a '-1 - i' encoder gets wrong.",
-  "sha256": "2d8523a53ea8a53a68d8017c9011a54788f9d5d828fe7a51b1d62a6319ec7dfa"
+  "sha256": "be019cd4bd9c92b0f437adf60fb856ecc2fdddfdae8ab106b1614a6cbd00a0e0"
 }

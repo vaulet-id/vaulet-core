@@ -1,4 +1,4 @@
-//! Recovery-file encryption (PLAN.md D3, M1 "simple backup first").
+//! Recovery-file encryption.
 //!
 //! Encrypts the private-key JWK with a user passphrase so it can be exported to
 //! a file (iCloud Drive / Files) and restored on another device. Non-custodial:

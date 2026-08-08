@@ -1,4 +1,4 @@
-//! Key management (PLAN.md D3)
+//! Key management
 //! Real keys live in the Secure Enclave (iOS) / StrongBox (Android) — Rust only
 //! sees a handle. Every signature goes through a platform channel to hardware.
 //! Shamir recovery (2-of-3, custom n-of-m) arrives in M3.

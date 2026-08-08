@@ -1,4 +1,4 @@
-//! Protocol layer (PLAN.md D2)
+//! Protocol layer
 //! M1: OID4VCI (claim) + OID4VP (present) only — deliberately no DIDComm in M1.
 //! M2: adds a didcomm module for chat.
 //!
