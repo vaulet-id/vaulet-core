@@ -395,15 +395,8 @@ mod tests {
     /// One shared vector: the envelope, the byte length of its canonical CBOR,
     /// and the sha256 of those bytes.
     fn shared_vector(name: &str) -> (serde_json::Value, usize, String) {
-        let raw = match name {
-            "base" => include_str!("../../vectors/belt/base.json"),
-            "documented" => include_str!("../../vectors/belt/documented.json"),
-            "boundary" => include_str!("../../vectors/belt/boundary.json"),
-            "frame-bound" => include_str!("../../vectors/belt/frame-bound.json"),
-            "depth-bound" => include_str!("../../vectors/belt/depth-bound.json"),
-            other => panic!("no shared vector named {other}"),
-        };
-        let v: serde_json::Value = serde_json::from_str(raw).expect("vector parses");
+        let v: serde_json::Value =
+            serde_json::from_str(crate::vectors::raw(name)).expect("vector parses");
         (
             v["envelope"].clone(),
             v["cbor_len"].as_u64().expect("cbor_len") as usize,

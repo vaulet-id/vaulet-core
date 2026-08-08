@@ -1,0 +1,17 @@
+# The Dart half of this crate's public surface: the shared capture vectors.
+#
+# It is a package in the same directory as the Rust crate on purpose. The
+# vectors are the encoding's contract, the encoding lives here, and both
+# languages must read ONE set of files — a copy per language is the exact
+# failure a vector exists to catch. Shipping them as a second package would have
+# meant a second thing to version and pin for a set of five JSON files that have
+# no life of their own.
+#
+# Consumed as a dev_dependency only: nothing in a shipped wallet reads these.
+name: vaulet_core
+description: The shared cross-language capture vectors that pin the Dart and Rust encoders to each other.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"

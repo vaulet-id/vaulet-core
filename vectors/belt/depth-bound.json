@@ -1,0 +1,136 @@
+{
+  "cbor_len": 965,
+  "envelope": {
+    "belt_version": "2.0",
+    "capture": {
+      "media": {
+        "depth_seq": {
+          "codec": "float32-raw",
+          "frames": [
+            {
+              "h": 240,
+              "hash": "d1",
+              "k": [
+                320.5,
+                320.5,
+                160.0,
+                120.0
+              ],
+              "t_ms": 0,
+              "w": 320
+            },
+            {
+              "h": 240,
+              "hash": "d2",
+              "k": [
+                320.5,
+                320.5,
+                160.0,
+                120.0
+              ],
+              "t_ms": 100,
+              "w": 320
+            }
+          ]
+        },
+        "ir_seq": null,
+        "rgb_clip": {
+          "codec": "jpeg-seq",
+          "frames": [
+            {
+              "h": 640,
+              "hash": "a",
+              "t_ms": 0,
+              "w": 480
+            },
+            {
+              "h": 640,
+              "hash": "b",
+              "t_ms": 100,
+              "w": 480
+            }
+          ],
+          "jpegs": [
+            "aa",
+            "bb"
+          ]
+        }
+      },
+      "sensors": {
+        "device_caps": {
+          "depth_available": true,
+          "has_front_depth": true,
+          "has_front_ir": true,
+          "model": "iPhone15,2",
+          "os": "18.0",
+          "platform": "ios"
+        }
+      }
+    },
+    "captured_at": 1700000000000,
+    "challenge": {
+      "rendered": [
+        {
+          "action": "look_up",
+          "t_ms": 0
+        },
+        {
+          "action": "blink",
+          "t_ms": 900
+        }
+      ],
+      "spec_id": "spec-1",
+      "type": "head_motion"
+    },
+    "clock_base": 0,
+    "dataset": {
+      "consent": {
+        "training_use": false,
+        "ts": 1700000000000,
+        "verify": true,
+        "version": "v1"
+      },
+      "pai_species": "none",
+      "session_type": "bona_fide"
+    },
+    "documents": [
+      {
+        "dg1_hash": null,
+        "dg2_hash": "d2",
+        "sod_hash": null,
+        "type": "epassport"
+      }
+    ],
+    "features": [
+      {
+        "brightness": -1.0,
+        "eye_l": 0.9,
+        "eye_lp": [
+          0.0,
+          0.0
+        ],
+        "eye_r": 0.9,
+        "eye_rp": [
+          0.0,
+          0.0
+        ],
+        "face_scale": 0.5,
+        "nose": [
+          0.0,
+          0.0
+        ],
+        "pitch": 2.0,
+        "roll": 0.0,
+        "skin": -1.0,
+        "t_ms": 0,
+        "yaw": 1.0
+      }
+    ],
+    "nonce": "nonce-1",
+    "platform": "ios",
+    "session_id": "sess-1"
+  },
+  "name": "depth-bound",
+  "note": "Plus the depth sequence and its intrinsics.",
+  "sha256": "16e323ae1c60d8eeea4d75d99335bfaf13d117d4e3a9b534b047bb38a748e93d"
+}

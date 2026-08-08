@@ -20,6 +20,12 @@ pub mod requests;
 pub mod statement;
 pub mod vouching;
 pub mod shamir;
+/// The shared cross-language capture vectors. Enabled for this crate's own
+/// tests and, via the `test-fixtures` feature, for the backend's — the same
+/// gate `emrtd::fixtures` uses, and for the same reason: test material must not
+/// reach a production build.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod vectors;
 
 use thiserror::Error;
 use zeroize::Zeroizing;

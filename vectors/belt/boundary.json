@@ -1,0 +1,96 @@
+{
+  "cbor_len": 748,
+  "envelope": {
+    "belt_version": "2.0",
+    "capture": {
+      "media": {
+        "depth_seq": null,
+        "ir_seq": null,
+        "rgb_clip": {
+          "codec": "jpeg-seq",
+          "frames": [
+            {
+              "h": 640,
+              "hash": "a",
+              "t_ms": 0,
+              "w": 480
+            },
+            {
+              "h": 640,
+              "hash": "b",
+              "t_ms": 100,
+              "w": 480
+            }
+          ]
+        }
+      },
+      "sensors": {
+        "device_caps": {
+          "depth_available": true,
+          "has_front_depth": true,
+          "has_front_ir": true,
+          "model": "iPhone15,2",
+          "os": "18.0",
+          "platform": "ios"
+        }
+      }
+    },
+    "captured_at": 9223372036854775807,
+    "challenge": {
+      "rendered": [
+        {
+          "action": "look_up",
+          "t_ms": 0
+        },
+        {
+          "action": "blink",
+          "t_ms": 900
+        }
+      ],
+      "spec_id": "spec-1",
+      "type": "head_motion"
+    },
+    "clock_base": -9223372036854775808,
+    "dataset": {
+      "consent": {
+        "training_use": false,
+        "ts": 1700000000000,
+        "verify": true,
+        "version": "v1"
+      },
+      "pai_species": "none",
+      "session_type": "bona_fide"
+    },
+    "features": [
+      {
+        "brightness": -1.0,
+        "eye_l": 0.9,
+        "eye_lp": [
+          0.0,
+          0.0
+        ],
+        "eye_r": 0.9,
+        "eye_rp": [
+          0.0,
+          0.0
+        ],
+        "face_scale": 0.5,
+        "nose": [
+          0.0,
+          0.0
+        ],
+        "pitch": 2.0,
+        "roll": 0.0,
+        "skin": -1.0,
+        "t_ms": 0,
+        "yaw": 1.0
+      }
+    ],
+    "nonce": "nonce-1",
+    "platform": "ios",
+    "session_id": "sess-1"
+  },
+  "name": "boundary",
+  "note": "The clock fields at both ends of the i64 range - the values a '-1 - i' encoder gets wrong.",
+  "sha256": "2d8523a53ea8a53a68d8017c9011a54788f9d5d828fe7a51b1d62a6319ec7dfa"
+}

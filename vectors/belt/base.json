@@ -1,0 +1,96 @@
+{
+  "cbor_len": 740,
+  "envelope": {
+    "belt_version": "2.0",
+    "capture": {
+      "media": {
+        "depth_seq": null,
+        "ir_seq": null,
+        "rgb_clip": {
+          "codec": "jpeg-seq",
+          "frames": [
+            {
+              "h": 640,
+              "hash": "a",
+              "t_ms": 0,
+              "w": 480
+            },
+            {
+              "h": 640,
+              "hash": "b",
+              "t_ms": 100,
+              "w": 480
+            }
+          ]
+        }
+      },
+      "sensors": {
+        "device_caps": {
+          "depth_available": true,
+          "has_front_depth": true,
+          "has_front_ir": true,
+          "model": "iPhone15,2",
+          "os": "18.0",
+          "platform": "ios"
+        }
+      }
+    },
+    "captured_at": 1700000000000,
+    "challenge": {
+      "rendered": [
+        {
+          "action": "look_up",
+          "t_ms": 0
+        },
+        {
+          "action": "blink",
+          "t_ms": 900
+        }
+      ],
+      "spec_id": "spec-1",
+      "type": "head_motion"
+    },
+    "clock_base": 0,
+    "dataset": {
+      "consent": {
+        "training_use": false,
+        "ts": 1700000000000,
+        "verify": true,
+        "version": "v1"
+      },
+      "pai_species": "none",
+      "session_type": "bona_fide"
+    },
+    "features": [
+      {
+        "brightness": -1.0,
+        "eye_l": 0.9,
+        "eye_lp": [
+          0.0,
+          0.0
+        ],
+        "eye_r": 0.9,
+        "eye_rp": [
+          0.0,
+          0.0
+        ],
+        "face_scale": 0.5,
+        "nose": [
+          0.0,
+          0.0
+        ],
+        "pitch": 2.0,
+        "roll": 0.0,
+        "skin": -1.0,
+        "t_ms": 0,
+        "yaw": 1.0
+      }
+    ],
+    "nonce": "nonce-1",
+    "platform": "ios",
+    "session_id": "sess-1"
+  },
+  "name": "base",
+  "note": "The capture envelope with no document, no uploaded frames and no depth.",
+  "sha256": "05c0031fce26c6887c4ec84beb757792d03e2bc04643671ccc349dfc5e66cc63"
+}
