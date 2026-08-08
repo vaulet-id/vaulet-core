@@ -3,6 +3,11 @@ name = "vaulet_core"
 version = "0.1.0"
 edition = "2021"
 description = "Vaulet identity core: keys, DIDs, credentials, OID4VC protocol (PLAN.md D5)"
+# Declared now, years before publication, because a licence added later needs the
+# agreement of everyone who has committed by then — today that is one person
+# (ADR 0032). It grants nothing to the rest of the repository, which stays all
+# rights reserved.
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["lib", "staticlib", "cdylib"]
