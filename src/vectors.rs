@@ -11,7 +11,7 @@
 //! dependency it already has, and no repository needs the files sitting at a
 //! fixed relative path.
 //!
-//! The Dart side reads the same `vectors/belt/*.json` through this directory's
+//! The Dart side reads the same `vectors/capture/*.json` through this directory's
 //! `pubspec.yaml`, so a single set of files backs both languages rather than a
 //! copy in each — a copy per language being precisely the failure a vector
 //! exists to catch.
@@ -19,17 +19,17 @@
 //! See `core/vectors/README.md` for the rule that makes them worth having: a
 //! vector is never regenerated from an implementation it checks.
 
-/// Every vector, by name, as the raw JSON recorded in `vectors/belt/`.
+/// Every vector, by name, as the raw JSON recorded in `vectors/capture/`.
 ///
 /// A consumer loops over this rather than naming vectors one at a time. A
 /// vector added to the directory but reaching nobody's assertions would look
 /// like coverage and be none; iterating makes that impossible to do quietly.
 pub const ALL: &[(&str, &str)] = &[
-    ("base", include_str!("../vectors/belt/base.json")),
-    ("documented", include_str!("../vectors/belt/documented.json")),
-    ("boundary", include_str!("../vectors/belt/boundary.json")),
-    ("frame-bound", include_str!("../vectors/belt/frame-bound.json")),
-    ("depth-bound", include_str!("../vectors/belt/depth-bound.json")),
+    ("base", include_str!("../vectors/capture/base.json")),
+    ("documented", include_str!("../vectors/capture/documented.json")),
+    ("boundary", include_str!("../vectors/capture/boundary.json")),
+    ("frame-bound", include_str!("../vectors/capture/frame-bound.json")),
+    ("depth-bound", include_str!("../vectors/capture/depth-bound.json")),
 ];
 
 /// One vector's raw JSON.

@@ -2,14 +2,14 @@
 
 A vector is one capture envelope with the byte length of its deterministic CBOR
 encoding and the sha256 of those bytes — a worked example with its answer
-written down. Each file under `belt/` holds all three.
+written down. Each file under `capture/` holds all three.
 
 Three implementations in two languages are pinned to them:
 
 - `core/src/dcbor.rs` — the Rust encoder, through `vaulet_core::vectors`
-- `backend/src/belt_envelope.rs` — the typed envelope the issuer recomputes
+- `backend/src/capture_envelope.rs` — the typed envelope the issuer recomputes
   from, through the same module
-- `app/test/belt_bundle_test.dart` — the Dart encoder **and** the bundle
+- `app/test/capture_bundle_test.dart` — the Dart encoder **and** the bundle
   assembly, through this directory's `pubspec.yaml`
 
 ## Why they live in the core crate

@@ -1,11 +1,11 @@
 //! Deterministic CBOR — the frozen `belt_v1` canonicalization (RFC 8949 §4.2).
 //!
-//! This is how the liveness belt bundle is hashed (see
-//! `app/lib/features/liveness_belt/belt_bundle.dart`), and this module is the
+//! This is how the capture layer bundle is hashed (see
+//! `app/lib/features/capture/capture_bundle.dart`), and this module is the
 //! Rust half of it. Its Dart twin is
-//! `app/lib/features/liveness_belt/dcbor.dart`; the two are pinned against the
+//! `app/lib/features/capture/dcbor.dart`; the two are pinned against the
 //! same test vectors so a bundle hashed on device recomputes to the same bytes
-//! on the server (`backend/src/belt_envelope.rs` is the typed envelope that
+//! on the server (`backend/src/capture_envelope.rs` is the typed envelope that
 //! feeds this encoder at `/api/v1/liveness/verify`).
 //!
 //! Encoding rules (RFC 8949 §4.2.1, "core deterministic"):
@@ -32,7 +32,7 @@
 
 use std::fmt;
 
-/// A CBOR data item, restricted to the types the belt envelope uses.
+/// A CBOR data item, restricted to the types the capture envelope uses.
 ///
 /// Integers and floats are separate variants on purpose: CBOR distinguishes
 /// them and Dart distinguishes `int` from `double`, so the two ends must agree
@@ -386,8 +386,8 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // THE SHARED VECTORS. The envelope, the encoded length and the hash all come
-    // from vectors/belt/*.json, which backend/src/belt_envelope.rs and
-    // app/test/belt_bundle_test.dart assert against too. Nothing here restates a
+    // from vectors/capture/*.json, which backend/src/capture_envelope.rs and
+    // app/test/capture_bundle_test.dart assert against too. Nothing here restates a
     // number: a vector this encoder could regenerate would only prove that the
     // encoder agrees with itself. See vectors/README.md.
     // -----------------------------------------------------------------------

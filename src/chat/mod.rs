@@ -494,7 +494,7 @@ impl Session {
         // — so this cannot clear the way itself. What makes re-adding work is
         // that an eviction drops the group when it is applied; see `receive`.
         //
-        // The clear below is the belt to that brace: a Welcome is authority to
+        // The clear below is the capture layer to that brace: a Welcome is authority to
         // be in the room, since it is encrypted to an init key only we hold and
         // whoever sent it has committed us into the group. Only the group is
         // discarded, never history.

@@ -39,7 +39,7 @@ const NONCE_LEN: usize = 24;
 pub const KEY_LEN: usize = 32;
 /// Bumped only if the plaintext layout changes. A sealed blob from a future
 /// version is refused **by name** rather than misparsed — the same courtesy the
-/// belt extends to a stale app (ADR 0011).
+/// capture layer extends to a stale app (ADR 0011).
 const VERSION: u8 = 1;
 
 /// Everything needed to rebuild a session: who we are, which signature key is

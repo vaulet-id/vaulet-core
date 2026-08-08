@@ -60,7 +60,7 @@ Directory _packageRoot() {
 /// the `sha256` of those bytes.
 Map<String, Object?> vector(String name) {
   _root ??= _packageRoot();
-  final f = File('${_root!.path}/vectors/belt/$name.json');
+  final f = File('${_root!.path}/vectors/capture/$name.json');
   if (!f.existsSync()) {
     throw ArgumentError('no shared vector named $name');
   }
