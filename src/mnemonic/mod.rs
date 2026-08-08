@@ -41,8 +41,8 @@ pub fn encode_key(scalar: &[u8; 32]) -> Result<String> {
 /// Returns `CoreError::Key("invalid recovery phrase")` on any failure (bad
 /// word, wrong length, or failed checksum).
 pub fn decode_key(phrase: &str) -> Result<[u8; 32]> {
-    let mnemonic =
-        Mnemonic::parse(phrase.trim()).map_err(|_| CoreError::Key("invalid recovery phrase".into()))?;
+    let mnemonic = Mnemonic::parse(phrase.trim())
+        .map_err(|_| CoreError::Key("invalid recovery phrase".into()))?;
     let (entropy, len) = mnemonic.to_entropy_array();
     if len != 32 {
         return Err(CoreError::Key("invalid recovery phrase".into()));

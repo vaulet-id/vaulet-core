@@ -25,10 +25,7 @@ fn lds_econtent(entries: &[(u8, Vec<u8>)]) -> Vec<u8> {
 fn parses_hash_algo_and_dg_hashes() {
     let dg1 = b"dg1-bytes";
     let dg2 = b"dg2-bytes";
-    let content = lds_econtent(&[
-        (1, digest("SHA-256", dg1)),
-        (2, digest("SHA-256", dg2)),
-    ]);
+    let content = lds_econtent(&[(1, digest("SHA-256", dg1)), (2, digest("SHA-256", dg2))]);
     let lds = parse_lds_econtent(&content).unwrap();
     assert_eq!(lds.hash_algo, "SHA-256");
     assert_eq!(lds.hashes.len(), 2);
@@ -111,7 +108,11 @@ fn tampered_dg_breaks_integrity_but_not_the_chain() {
     assert!(!v.dg_integrity);
     assert!(v.sod_signature);
     assert_eq!(v.chain, ChainStatus::Trusted);
-    assert!(v.notes.iter().any(|n| n == "DG2 hash mismatch"), "{:?}", v.notes);
+    assert!(
+        v.notes.iter().any(|n| n == "DG2 hash mismatch"),
+        "{:?}",
+        v.notes
+    );
     assert!(!v.is_genuine());
 }
 
@@ -132,7 +133,11 @@ fn synthetic_aa_chip() -> (Vec<u8>, p256::ecdsa::SigningKey) {
 /// An AA-capable synthetic passport: its SOD covers DG1, DG2 *and* the DG15 of
 /// [`synthetic_aa_chip`], so the key that answers the challenge is one the
 /// issuing state signed — the only shape in which an AA answer is checked at all.
-fn synthetic_aa_passport() -> (fixtures::SyntheticPassport, Vec<u8>, p256::ecdsa::SigningKey) {
+fn synthetic_aa_passport() -> (
+    fixtures::SyntheticPassport,
+    Vec<u8>,
+    p256::ecdsa::SigningKey,
+) {
     let (dg15, key) = synthetic_aa_chip();
     let mut dgs = BTreeMap::new();
     dgs.insert(1u8, b"SYNTHETIC-DG1-NOT-A-REAL-MRZ".to_vec());
@@ -458,7 +463,10 @@ fn junk_aa_signature_on_an_rsa_key_does_not_buy_genuineness() {
         v.notes
     );
     assert!(
-        !omitted.notes.iter().any(|n| n.starts_with("AA not verified:")),
+        !omitted
+            .notes
+            .iter()
+            .any(|n| n.starts_with("AA not verified:")),
         "{:?}",
         omitted.notes
     );
@@ -561,8 +569,13 @@ fn an_aa_key_the_sod_does_not_cover_is_ignored_not_credited() {
     let mut dgs = p.dgs.clone();
     dgs.insert(15, uncovered_dg15.clone());
 
-    let v = verify_passport(&p.sod, &dgs, &[p.csca], Some((&uncovered_dg15, &challenge, &sig)))
-        .unwrap();
+    let v = verify_passport(
+        &p.sod,
+        &dgs,
+        &[p.csca],
+        Some((&uncovered_dg15, &challenge, &sig)),
+    )
+    .unwrap();
     // The answer verifies against the supplied key — and is thrown away, because
     // nothing binds that key to the document.
     assert_eq!(v.active_auth, None, "{:?}", v.notes);
@@ -619,8 +632,13 @@ fn an_aa_key_that_is_not_the_one_the_sod_covers_is_ignored() {
     // about — the swapped key arrives through the AA material alone.
     let mut dgs = p.dgs.clone();
     dgs.remove(&15);
-    let v = verify_passport(&p.sod, &dgs, &[p.csca], Some((&substitute_dg15, &challenge, &sig)))
-        .unwrap();
+    let v = verify_passport(
+        &p.sod,
+        &dgs,
+        &[p.csca],
+        Some((&substitute_dg15, &challenge, &sig)),
+    )
+    .unwrap();
     assert!(v.dg_integrity, "{:?}", v.notes);
     assert_eq!(v.active_auth, None, "{:?}", v.notes);
     assert!(

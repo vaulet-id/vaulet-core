@@ -378,7 +378,10 @@ mod tests {
         assert_eq!(json_hex(&json!(-1)), "20");
         assert_eq!(json_hex(&json!(-1.0)), "fbbff0000000000000");
         assert_eq!(json_hex(&json!(null)), "f6");
-        assert_eq!(json_hex(&json!({"a": 1, "b": [2, 3]})), "a26161016162820203");
+        assert_eq!(
+            json_hex(&json!({"a": 1, "b": [2, 3]})),
+            "a26161016162820203"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -499,8 +502,8 @@ mod tests {
 
     #[test]
     fn belt_envelope_with_documents_matches_the_shared_test_vector() {
-        let bytes = encode(&Cbor::from_json(&belt_envelope_with_documents_fixture()).unwrap())
-            .unwrap();
+        let bytes =
+            encode(&Cbor::from_json(&belt_envelope_with_documents_fixture()).unwrap()).unwrap();
         let digest = to_hex(&Sha256::digest(&bytes));
 
         // Asserted identically by app/test/belt_bundle_test.dart against the

@@ -239,10 +239,7 @@ mod tests {
         );
         let d = parse_dg11(&bytes);
         assert_eq!(d.name_of_holder.as_deref(), Some("ANNA MARIA ERIKSSON"));
-        assert_eq!(
-            d.place_of_birth.as_deref(),
-            Some("UTOPIA, CITY, OF, BIRTH")
-        );
+        assert_eq!(d.place_of_birth.as_deref(), Some("UTOPIA, CITY, OF, BIRTH"));
         assert_eq!(d.personal_number.as_deref(), Some("1234567890123"));
         assert_eq!(d.profession.as_deref(), Some("ENGINEER"));
         assert_eq!(d.title, None);

@@ -42,8 +42,7 @@ impl SoftwareKey {
     /// Public-only JWK — used to build did:jwk and embed in credentials.
     pub fn public_jwk(&self) -> Result<Value> {
         let jwk = self.secret.public_key().to_jwk_string();
-        serde_json::from_str(&jwk)
-            .map_err(|e| CoreError::Key(format!("public jwk parse: {e}")))
+        serde_json::from_str(&jwk).map_err(|e| CoreError::Key(format!("public jwk parse: {e}")))
     }
 
     /// Raw 32-byte private scalar (the P-256 `d` value, big-endian).

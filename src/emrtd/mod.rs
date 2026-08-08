@@ -374,7 +374,10 @@ fn der_tlv_bytes(tag: u8, value: &[u8]) -> Vec<u8> {
         out.push(len as u8);
     } else {
         let bytes = len.to_be_bytes();
-        let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        let start = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
         let n = bytes.len() - start;
         out.push(0x80 | n as u8);
         out.extend_from_slice(&bytes[start..]);
@@ -492,7 +495,9 @@ fn verify_sod_inner(
         }
         // to_der() on the SignedAttributes (SET OF) emits the 0x31 SET tag that
         // RFC 5652 §5.4 requires for the signature, not the [0] IMPLICIT tag.
-        attrs.to_der().map_err(|e| bad(format!("signedAttrs: {e}")))?
+        attrs
+            .to_der()
+            .map_err(|e| bad(format!("signedAttrs: {e}")))?
     } else {
         lds_der.clone()
     };
@@ -552,14 +557,8 @@ fn verify_dsc_chain(
             Ok(b) => b,
             Err(_) => continue,
         };
-        if verify_signature(
-            &ca_spki,
-            &dsc.signature_algorithm.oid,
-            &sig_hash,
-            &tbs,
-            sig,
-        )
-        .unwrap_or(false)
+        if verify_signature(&ca_spki, &dsc.signature_algorithm.oid, &sig_hash, &tbs, sig)
+            .unwrap_or(false)
         {
             return ChainStatus::Trusted;
         }
@@ -607,7 +606,9 @@ fn verify_signature(
             if hbits > nbits {
                 e >>= (hbits - nbits) as usize;
             }
-            return Ok(ecdsa_verify_generic(&p, &a, &n, &gx, &gy, &qx, &qy, &e, &r, &s));
+            return Ok(ecdsa_verify_generic(
+                &p, &a, &n, &gx, &gy, &qx, &qy, &e, &r, &s,
+            ));
         }
         let hex: String = spki_der.iter().map(|b| format!("{b:02x}")).collect();
         return Err(bad(format!("unsupported ECDSA curve; spki={hex}")));
@@ -621,20 +622,40 @@ fn verify_signature(
         if oid == "1.2.840.113549.1.1.10" {
             // RSASSA-PSS (params default to the digest's own MGF1/salt for eMRTD).
             let ok = match hash_algo {
-                "SHA-1" => key.verify(rsa::pss::Pss::new::<Sha1>(), &hashed, sig).is_ok(),
-                "SHA-224" => key.verify(rsa::pss::Pss::new::<Sha224>(), &hashed, sig).is_ok(),
-                "SHA-384" => key.verify(rsa::pss::Pss::new::<Sha384>(), &hashed, sig).is_ok(),
-                "SHA-512" => key.verify(rsa::pss::Pss::new::<Sha512>(), &hashed, sig).is_ok(),
-                _ => key.verify(rsa::pss::Pss::new::<Sha256>(), &hashed, sig).is_ok(),
+                "SHA-1" => key
+                    .verify(rsa::pss::Pss::new::<Sha1>(), &hashed, sig)
+                    .is_ok(),
+                "SHA-224" => key
+                    .verify(rsa::pss::Pss::new::<Sha224>(), &hashed, sig)
+                    .is_ok(),
+                "SHA-384" => key
+                    .verify(rsa::pss::Pss::new::<Sha384>(), &hashed, sig)
+                    .is_ok(),
+                "SHA-512" => key
+                    .verify(rsa::pss::Pss::new::<Sha512>(), &hashed, sig)
+                    .is_ok(),
+                _ => key
+                    .verify(rsa::pss::Pss::new::<Sha256>(), &hashed, sig)
+                    .is_ok(),
             };
             return Ok(ok);
         }
         let ok = match hash_algo {
-            "SHA-1" => key.verify(rsa::Pkcs1v15Sign::new::<Sha1>(), &hashed, sig).is_ok(),
-            "SHA-224" => key.verify(rsa::Pkcs1v15Sign::new::<Sha224>(), &hashed, sig).is_ok(),
-            "SHA-384" => key.verify(rsa::Pkcs1v15Sign::new::<Sha384>(), &hashed, sig).is_ok(),
-            "SHA-512" => key.verify(rsa::Pkcs1v15Sign::new::<Sha512>(), &hashed, sig).is_ok(),
-            _ => key.verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &hashed, sig).is_ok(),
+            "SHA-1" => key
+                .verify(rsa::Pkcs1v15Sign::new::<Sha1>(), &hashed, sig)
+                .is_ok(),
+            "SHA-224" => key
+                .verify(rsa::Pkcs1v15Sign::new::<Sha224>(), &hashed, sig)
+                .is_ok(),
+            "SHA-384" => key
+                .verify(rsa::Pkcs1v15Sign::new::<Sha384>(), &hashed, sig)
+                .is_ok(),
+            "SHA-512" => key
+                .verify(rsa::Pkcs1v15Sign::new::<Sha512>(), &hashed, sig)
+                .is_ok(),
+            _ => key
+                .verify(rsa::Pkcs1v15Sign::new::<Sha256>(), &hashed, sig)
+                .is_ok(),
         };
         return Ok(ok);
     }
@@ -841,13 +862,31 @@ mod ecdsa_generic_tests {
     fn parses_explicit_brainpool_spki() {
         let spki = unhex("308201333081ec06072a8648ce3d02013081e0020101302c06072a8648ce3d0101022100a9fb57dba1eea9bc3e660a909d838d726e3bf623d52620282013481d1f6e5377304404207d5a0975fc2c3057eef67530417affe7fb8055c126dc5c6ce94a4b44f330b5d9042026dc5c6ce94a4b44f330b5d9bbd77cbf958416295cf7e1ce6bccdc18ff8c07b60441048bd2aeb9cb7e57cb2c4b482ffc81b7afb9de27e1e3bd23c23a4453bd9ace3262547ef835c3dac4fd97f8461a14611dc9c27745132ded8e545c1d54c72f046997022100a9fb57dba1eea9bc3e660a909d838d718c397aa3b561a6f7901e0e82974856a702010103420004648cad39a585841d16d98cb2cf0d1a4dd0d987ec709630182fcd6970149e3c5d1dc215968bf364048146cb44ea6510bd0dc05036f98b6d0434c00cba6ff406dc");
         let (p, a, n, gx, gy, qx, qy) = parse_ec_explicit_spki(&spki).unwrap();
-        assert_eq!(p, hx(b"A9FB57DBA1EEA9BC3E660A909D838D726E3BF623D52620282013481D1F6E5377"));
-        assert_eq!(a, hx(b"7D5A0975FC2C3057EEF67530417AFFE7FB8055C126DC5C6CE94A4B44F330B5D9"));
-        assert_eq!(n, hx(b"A9FB57DBA1EEA9BC3E660A909D838D718C397AA3B561A6F7901E0E82974856A7"));
-        assert_eq!(gx, hx(b"8BD2AEB9CB7E57CB2C4B482FFC81B7AFB9DE27E1E3BD23C23A4453BD9ACE3262"));
+        assert_eq!(
+            p,
+            hx(b"A9FB57DBA1EEA9BC3E660A909D838D726E3BF623D52620282013481D1F6E5377")
+        );
+        assert_eq!(
+            a,
+            hx(b"7D5A0975FC2C3057EEF67530417AFFE7FB8055C126DC5C6CE94A4B44F330B5D9")
+        );
+        assert_eq!(
+            n,
+            hx(b"A9FB57DBA1EEA9BC3E660A909D838D718C397AA3B561A6F7901E0E82974856A7")
+        );
+        assert_eq!(
+            gx,
+            hx(b"8BD2AEB9CB7E57CB2C4B482FFC81B7AFB9DE27E1E3BD23C23A4453BD9ACE3262")
+        );
         // Public key point.
-        assert_eq!(qx, hx(b"648CAD39A585841D16D98CB2CF0D1A4DD0D987EC709630182FCD6970149E3C5D"));
-        assert_eq!(qy, hx(b"1DC215968BF364048146CB44EA6510BD0DC05036F98B6D0434C00CBA6FF406DC"));
+        assert_eq!(
+            qx,
+            hx(b"648CAD39A585841D16D98CB2CF0D1A4DD0D987EC709630182FCD6970149E3C5D")
+        );
+        assert_eq!(
+            qy,
+            hx(b"1DC215968BF364048146CB44EA6510BD0DC05036F98B6D0434C00CBA6FF406DC")
+        );
         // Q must lie on the curve: y² == x³ + a·x + b (mod p).  b from the SPKI.
         let b = hx(b"26DC5C6CE94A4B44F330B5D9BBD77CBF958416295CF7E1CE6BCCDC18FF8C07B6");
         let lhs = (&qy * &qy) % &p;

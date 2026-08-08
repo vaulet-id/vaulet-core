@@ -92,10 +92,27 @@ pub fn synthetic_passport_with_dgs(dgs: BTreeMap<u8, Vec<u8>>) -> SyntheticPassp
     let dsc_key = SigningKey::from_bytes(&[9u8; 32].into()).expect("dsc key");
     let other_key = SigningKey::from_bytes(&[11u8; 32].into()).expect("other csca key");
 
-    let csca = make_cert("CN=Vaulet Test CSCA", "CN=Vaulet Test CSCA", 1, &csca_key, &csca_key);
-    let dsc = make_cert("CN=Vaulet Test DSC", "CN=Vaulet Test CSCA", 2, &dsc_key, &csca_key);
-    let unrelated =
-        make_cert("CN=Vaulet Other CSCA", "CN=Vaulet Other CSCA", 1, &other_key, &other_key);
+    let csca = make_cert(
+        "CN=Vaulet Test CSCA",
+        "CN=Vaulet Test CSCA",
+        1,
+        &csca_key,
+        &csca_key,
+    );
+    let dsc = make_cert(
+        "CN=Vaulet Test DSC",
+        "CN=Vaulet Test CSCA",
+        2,
+        &dsc_key,
+        &csca_key,
+    );
+    let unrelated = make_cert(
+        "CN=Vaulet Other CSCA",
+        "CN=Vaulet Other CSCA",
+        1,
+        &other_key,
+        &other_key,
+    );
 
     let entries: Vec<(u8, Vec<u8>)> = dgs
         .iter()
@@ -111,7 +128,10 @@ pub fn synthetic_passport_with_dgs(dgs: BTreeMap<u8, Vec<u8>>) -> SyntheticPassp
     // signedAttrs: contentType + messageDigest over the eContent (RFC 5652 §5.3).
     let message_digest = Sha256::digest(&lds).to_vec();
     let signed_attrs: SignedAttributes = SetOfVec::try_from(vec![
-        attribute(OID_CONTENT_TYPE, Any::encode_from(&OID_LDS_SECURITY_OBJECT).unwrap()),
+        attribute(
+            OID_CONTENT_TYPE,
+            Any::encode_from(&OID_LDS_SECURITY_OBJECT).unwrap(),
+        ),
         attribute(
             OID_MESSAGE_DIGEST,
             Any::encode_from(&OctetString::new(message_digest).unwrap()).unwrap(),
@@ -167,7 +187,10 @@ pub fn tlv(tag: u8, value: &[u8]) -> Vec<u8> {
         out.push(len as u8);
     } else {
         let bytes = len.to_be_bytes();
-        let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        let start = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
         out.push(0x80 | (bytes.len() - start) as u8);
         out.extend_from_slice(&bytes[start..]);
     }
@@ -190,15 +213,24 @@ fn lds_security_object(entries: &[(u8, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn alg_ecdsa_sha256() -> AlgorithmIdentifierOwned {
-    AlgorithmIdentifierOwned { oid: OID_ECDSA_SHA256, parameters: None }
+    AlgorithmIdentifierOwned {
+        oid: OID_ECDSA_SHA256,
+        parameters: None,
+    }
 }
 
 fn alg_sha256() -> AlgorithmIdentifierOwned {
-    AlgorithmIdentifierOwned { oid: OID_SHA256, parameters: Some(Any::null()) }
+    AlgorithmIdentifierOwned {
+        oid: OID_SHA256,
+        parameters: Some(Any::null()),
+    }
 }
 
 fn attribute(oid: ObjectIdentifier, value: AttributeValue) -> Attribute {
-    Attribute { oid, values: SetOfVec::try_from(vec![value]).unwrap() }
+    Attribute {
+        oid,
+        values: SetOfVec::try_from(vec![value]).unwrap(),
+    }
 }
 
 /// Issue a certificate for `subject_key`, signed by `issuer_key` (ECDSA/SHA-256).

@@ -56,7 +56,9 @@ fn scalar_from(b: &[u8; 32]) -> Option<Scalar> {
 
 /// A valid SLIP-0010 P-256 key: parses as a scalar in `[1, n-1]`.
 fn is_valid(b: &[u8; 32]) -> bool {
-    scalar_from(b).map(|s| !bool::from(s.is_zero())).unwrap_or(false)
+    scalar_from(b)
+        .map(|s| !bool::from(s.is_zero()))
+        .unwrap_or(false)
 }
 
 /// SLIP-0010 master node for the nist256p1 curve.
@@ -164,7 +166,10 @@ mod tests {
 
     fn hex(h: &[u8]) -> Vec<u8> {
         let s = std::str::from_utf8(h).unwrap();
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
     fn hex_str(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()

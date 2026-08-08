@@ -66,10 +66,7 @@ pub fn did_web_url(did: &str) -> crate::Result<String> {
 /// Matches a `verificationMethod` entry whose `id` equals `kid` exactly, or
 /// whose fragment matches (`#<kid>`) so a bare fragment resolves too. Returns
 /// its `publicKeyJwk`.
-pub fn signing_jwk_for_kid(
-    doc: &serde_json::Value,
-    kid: &str,
-) -> crate::Result<serde_json::Value> {
+pub fn signing_jwk_for_kid(doc: &serde_json::Value, kid: &str) -> crate::Result<serde_json::Value> {
     let methods = doc
         .get("verificationMethod")
         .and_then(|v| v.as_array())
@@ -88,7 +85,9 @@ pub fn signing_jwk_for_kid(
                 .ok_or_else(|| crate::CoreError::Key(format!("no publicKeyJwk for kid {kid}")));
         }
     }
-    Err(crate::CoreError::Key(format!("kid not found in did doc: {kid}")))
+    Err(crate::CoreError::Key(format!(
+        "kid not found in did doc: {kid}"
+    )))
 }
 
 /// A `did:web` resolver with the HTTP fetch **injected** by the host app, so the

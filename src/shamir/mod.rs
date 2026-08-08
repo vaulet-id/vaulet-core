@@ -80,7 +80,9 @@ pub fn reconstruct(shares: &[String]) -> Result<Vec<u8>> {
     // derives a DID, which either matches the wallet or the recovery failed.
     let checksum = checksum.unwrap();
     if !checksum.is_empty() && secret_checksum(&secret) != checksum.as_slice() {
-        return Err(CoreError::Key("shares did not reconstruct a valid key".into()));
+        return Err(CoreError::Key(
+            "shares did not reconstruct a valid key".into(),
+        ));
     }
     Ok(secret)
 }
@@ -127,7 +129,10 @@ mod tests {
         assert_eq!(shares.len(), 3);
         // Any 2 of the 3 recover.
         assert_eq!(reconstruct(&shares[0..2]).unwrap(), secret);
-        assert_eq!(reconstruct(&[shares[0].clone(), shares[2].clone()]).unwrap(), secret);
+        assert_eq!(
+            reconstruct(&[shares[0].clone(), shares[2].clone()]).unwrap(),
+            secret
+        );
         assert_eq!(reconstruct(&shares[1..3]).unwrap(), secret);
         // All 3 also recover.
         assert_eq!(reconstruct(&shares).unwrap(), secret);
