@@ -1,4 +1,4 @@
-//! Checking address reference data before believing it (ADR 0031).
+//! Checking reference data before believing it (ADR 0031).
 //!
 //! The tree of provinces, districts and sub-localities arrives over the
 //! network, and nothing in this system trusts the network. A dataset that
@@ -20,6 +20,8 @@ use crate::{CoreError, Result};
 /// What the attestation said, once it held up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attested {
+    /// The country, for a country's tree — or the dataset's name, for data that
+    /// is not about one country. See [`verify_dataset`].
     pub country: String,
     /// Moves when the data does. A wallet compares it against what it has
     /// rather than downloading a country to find out whether it needed to.
@@ -34,6 +36,37 @@ pub struct Attested {
 /// agree until the day a library orders a key differently.
 pub fn verify(
     country: &str,
+    data: &str,
+    attestation: &str,
+    voucher_doc: &Value,
+    pinned: &[String],
+) -> Result<Attested> {
+    check("country", country, data, attestation, voucher_doc, pinned)
+}
+
+/// The same check for reference data that is not one country's.
+///
+/// The country list is the first: it is about every country and belongs to
+/// none, so there is no country field to match. What is matched instead is the
+/// dataset's name, and for the same reason — a signature over the address tree,
+/// served as the country list, is a real signature over the wrong thing.
+pub fn verify_dataset(
+    dataset: &str,
+    data: &str,
+    attestation: &str,
+    voucher_doc: &Value,
+    pinned: &[String],
+) -> Result<Attested> {
+    check("dataset", dataset, data, attestation, voucher_doc, pinned)
+}
+
+/// **What the attestation is about is named in it, and checked.** Which field
+/// carries that name is the only difference between the two callers above;
+/// everything that makes this safe — the digest first, then the key — is one
+/// piece of code, because two copies of it would drift.
+fn check(
+    field: &str,
+    name: &str,
     data: &str,
     attestation: &str,
     voucher_doc: &Value,
@@ -54,24 +87,29 @@ pub fn verify(
     let actual = B64.encode(Sha256::digest(data.as_bytes()));
     if actual != expected {
         return Err(CoreError::Credential(
-            "the address data is not what was signed".into(),
+            "the reference data is not what was signed".into(),
         ));
     }
 
-    // And that it is this country's. Otherwise Thailand's tree could be served
-    // under another country's name with a signature that checks out.
-    match payload.get("country").and_then(Value::as_str) {
-        Some(c) if c.eq_ignore_ascii_case(country) => {}
+    // And that it is the thing that was asked for. Otherwise Thailand's tree
+    // could be served under another country's name — or as the country list —
+    // with a signature that checks out.
+    match payload.get(field).and_then(Value::as_str) {
+        Some(c) if c.eq_ignore_ascii_case(name) => {}
         Some(c) => {
             return Err(CoreError::Credential(format!(
-                "this is {c}'s data, not {country}'s"
+                "this is {c}'s data, not {name}'s"
             )))
         }
-        None => return Err(CoreError::Credential("the attestation names no country".into())),
+        None => {
+            return Err(CoreError::Credential(format!(
+                "the attestation names no {field}"
+            )))
+        }
     }
 
     Ok(Attested {
-        country: country.to_uppercase(),
+        country: name.to_uppercase(),
         version: payload
             .get("version")
             .and_then(Value::as_str)
@@ -166,5 +204,55 @@ mod tests {
         let stranger = SoftwareKey::generate();
         let a = attestation(&stranger, DATA, "TH");
         assert!(verify("TH", DATA, &a, &voucher, &["not-this-one".to_string()]).is_err());
+    }
+
+    /// A dataset that belongs to no country is checked by its name instead.
+    #[test]
+    fn a_dataset_that_was_signed_is_accepted() {
+        let (key, voucher, pins) = world();
+        const LIST: &str = r#"{"dataset":"countries","countries":[]}"#;
+        let a = signed(
+            &key,
+            &json!({
+                "dataset": "countries",
+                "version": "iso3166-1-cldr48.2.0",
+                "digest": B64.encode(Sha256::digest(LIST.as_bytes())),
+            }),
+        );
+        let out = verify_dataset("countries", LIST, &a, &voucher, &pins).unwrap();
+        assert_eq!(out.version, "iso3166-1-cldr48.2.0");
+    }
+
+    /// **The two do not substitute for each other.** An attestation naming a
+    /// country is a real signature by the right key over the right bytes, and
+    /// accepting it as the country list would mean the name in it was never
+    /// read — which is the whole reason it is in there.
+    #[test]
+    fn an_attestation_for_a_country_is_not_one_for_a_dataset() {
+        let (key, voucher, pins) = world();
+        let a = attestation(&key, DATA, "TH");
+        let err = verify_dataset("countries", DATA, &a, &voucher, &pins).unwrap_err();
+        assert!(
+            err.to_string().contains("names no dataset"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn an_attestation_for_a_dataset_is_not_one_for_a_country() {
+        let (key, voucher, pins) = world();
+        let a = signed(
+            &key,
+            &json!({
+                "dataset": "countries",
+                "version": "v1",
+                "digest": B64.encode(Sha256::digest(DATA.as_bytes())),
+            }),
+        );
+        let err = verify("TH", DATA, &a, &voucher, &pins).unwrap_err();
+        assert!(
+            err.to_string().contains("names no country"),
+            "unexpected: {err}"
+        );
     }
 }
