@@ -489,16 +489,29 @@ impl Session {
             return Err(ChatError::Malformed("not a welcome"));
         };
 
-        // **A group we already hold cannot be staged over**, and OpenMLS says so
-        // before the Welcome can be read far enough to learn which group it is
-        // — so this cannot clear the way itself. What makes re-adding work is
-        // that an eviction drops the group when it is applied; see `receive`.
+        // **A group we already hold is replaced, and the library is asked to do
+        // it.** A Welcome is authority to be in the room: it is encrypted to an
+        // init key only we hold, and whoever sent it has committed us into the
+        // group. So holding that group already is not a reason to refuse — it is
+        // the ordinary shape of being re-added after an eviction, and of being
+        // invited by two people at once.
         //
-        // The clear below is the capture layer to that brace: a Welcome is authority to
-        // be in the room, since it is encrypted to an init key only we hold and
-        // whoever sent it has committed us into the group. Only the group is
-        // discarded, never history.
-        let staged = StagedWelcome::new_from_welcome(
+        // OpenMLS refuses by default (`WelcomeError::GroupAlreadyExists`, raised
+        // while staging, before `into_group` is ever reached) and offers
+        // `replace_old_group` for exactly this. Asking for it replaces what was
+        // hand-rolled here: a `MlsGroup::load` and `delete` placed *after* the
+        // staging that refuses first, so it never ran and could not have. Only
+        // the group is discarded, never history.
+        //
+        // **Replacing means the last Welcome wins, which is why the caller must
+        // still check.** Two Welcomes for one room can name two different
+        // branches — the winner's and the loser's, when two members raced to
+        // invite the same person — and nothing in a Welcome says which. A caller
+        // that already held this room has therefore been invited twice and must
+        // repair rather than trust either branch: see `Session::room_info` and
+        // the rejoin path. Returning the room id is enough for it to notice,
+        // because it knows what rooms it had.
+        let staged = StagedWelcome::build_from_welcome(
             &self.provider,
             &MlsGroupJoinConfig::builder()
                 // See `create_room`: without this, a message from the epoch we
@@ -513,14 +526,11 @@ impl Session {
                 .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
                 .build(),
             welcome,
-            None,
         )
+        .map_err(mls)?
+        .replace_old_group()
+        .build()
         .map_err(mls)?;
-
-        let id = staged.group_context().group_id().clone();
-        if let Ok(Some(mut old)) = MlsGroup::load(self.provider.storage(), &id) {
-            old.delete(self.provider.storage()).map_err(mls)?;
-        }
 
         let group = staged.into_group(&self.provider).map_err(mls)?;
         Ok(group.group_id().as_slice().to_vec())
@@ -1269,6 +1279,69 @@ mod tests {
             bob.join(&to_second.welcome).is_err(),
             "reusing a key package must fail here rather than produce a room \
              one side cannot read"
+        );
+    }
+
+    /// **Two people inviting one person at once, which is ordinary rather than
+    /// perverse** — and the case that made the invitee vanish.
+    ///
+    /// Both inviters hold a package the invitee published, so both Welcomes open.
+    /// One inviter's commit wins the tie-break and the other's branch is
+    /// abandoned; whichever Welcome the invitee applies *last* is the branch they
+    /// end up on, and nothing inside a Welcome says which one that is.
+    ///
+    /// This pins the two halves the repair rests on, both against what OpenMLS
+    /// actually does rather than against our reading of it:
+    ///
+    /// - the second Welcome **is accepted**, where it used to fail with
+    ///   `GroupAlreadyExists` and leave the invitee wherever the first put them;
+    /// - it names **the same room**, which is how a client that keeps a room list
+    ///   knows it has been invited twice and must repair instead of trusting the
+    ///   branch it just landed on.
+    ///
+    /// Why the repair cannot be skipped: the invitee's own announcement is an
+    /// application message on whatever branch they are on, so on an abandoned one
+    /// it decrypts for nobody. Nobody learns their address, so nothing is ever
+    /// sent to them, so they never fail a decrypt and no self-heal fires. Healthy
+    /// from the inside at every end, and nothing times out.
+    #[test]
+    fn a_second_welcome_for_one_room_is_accepted_and_names_that_room() {
+        let mut ann = Session::new(b"did:peer:ann").unwrap();
+        let mut ben = Session::new(b"did:peer:ben").unwrap();
+        let mut ken = Session::new(b"did:peer:ken").unwrap();
+
+        // ann makes the room and ben is in it, so both can commit an add.
+        let room = ann.create_room().unwrap();
+        let ben_package = ben.key_package().unwrap();
+        let to_ben = ann.add_member(&room, &ben_package).unwrap();
+        ben.join(&to_ben.welcome).unwrap();
+
+        // **A fresh package each, as a client really publishes them.** Ken hands
+        // one to every contact, so both Welcomes are openable — which is what
+        // takes this to the group-already-exists path rather than to the missing
+        // init key of the test above. Sharing one package here would have made
+        // this test pass for the wrong reason.
+        let for_ann = ken.key_package().unwrap();
+        let for_ben = ken.key_package().unwrap();
+        let from_ann = ann.add_member(&room, &for_ann).unwrap();
+        let from_ben = ben.add_member(&room, &for_ben).unwrap();
+
+        let first = ken.join(&from_ann.welcome).unwrap();
+        let second = ken
+            .join(&from_ben.welcome)
+            .expect("a second Welcome for a room already held must be accepted");
+        assert_eq!(
+            first, second,
+            "both Welcomes name one room, which is what tells a client it was \
+             invited twice"
+        );
+
+        // And the branch that arrived last is the one in force: what ben says
+        // now is readable, which it would not be from ann's abandoned branch.
+        let said = ben.send(&room, b"from the winning branch").unwrap();
+        assert!(
+            matches!(ken.receive(&said), Ok(Received::Application { .. })),
+            "the replaced group must be the one the last Welcome named"
         );
     }
 
