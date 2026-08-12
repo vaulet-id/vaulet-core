@@ -20,6 +20,7 @@ use zeroize::Zeroize;
 use crate::{CoreError, Result};
 
 pub mod simple;
+pub mod vault;
 
 // Argon2id parameters — kept in the envelope so a future decrypt can reproduce
 // the derivation even if these defaults change.
