@@ -666,6 +666,17 @@ pub mod oid4vp {
         /// disclose nothing beyond the always-visible (Z2) claims.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub claims: Vec<String>,
+        /// **The holder signs this one themselves** — a Page, whose answers are
+        /// typed rather than held (ADR 0042).
+        ///
+        /// Said on the ask rather than left for the wallet to work out from the
+        /// `vct`, because the two cases need opposite behaviour: everything
+        /// else is looked for among what is already held and obtained when it
+        /// is missing, and this is never held, never obtainable, and minted at
+        /// the moment of answering. A wallet that guessed wrong would send
+        /// somebody to fetch a credential nobody issues.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub self_asserted: bool,
     }
 
     /// A DCQL query — the standard way to ask for credentials (OID4VP 1.0 §6).
@@ -1059,6 +1070,7 @@ pub mod oid4vp {
             let q = DcqlQuery::for_credentials(&[RequestedCredential {
                 vct: "https://issuer.example/credential/verified_email".into(),
                 claims: vec!["email".into()],
+            self_asserted: false,
             }]);
             let c = &q.credentials[0];
 
@@ -1084,6 +1096,7 @@ pub mod oid4vp {
             let q = DcqlQuery::for_credentials(&[RequestedCredential {
                 vct: "https://issuer.example/credential/org.icao.epassport".into(),
                 claims: vec![],
+            self_asserted: false,
             }]);
             assert_eq!(q.credentials[0].id, "org_icao_epassport");
         }
@@ -1096,11 +1109,13 @@ pub mod oid4vp {
                     RequestedCredential {
                         vct: "https://issuer.example/credential/verified_email".into(),
                         claims: vec!["email".into()],
-                    },
+                    self_asserted: false,
+            },
                     RequestedCredential {
                         vct: "https://issuer.example/credential/verified_phone".into(),
                         claims: vec!["phone".into()],
-                    },
+                    self_asserted: false,
+            },
                 ],
                 dcql_query: None,
                 nonce: "vp-nonce-123".into(),
@@ -1166,6 +1181,7 @@ pub mod oid4vp {
             let rc = RequestedCredential {
                 vct: "https://issuer.example/credential/codefin-identity".into(),
                 claims: vec![],
+            self_asserted: false,
             };
             let v = serde_json::to_value(&rc).unwrap();
             assert!(
