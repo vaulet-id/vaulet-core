@@ -18,6 +18,7 @@ pub mod recovery;
 pub mod rule;
 pub mod requests;
 pub mod statement;
+pub mod certificate;
 pub mod vouching;
 pub mod shamir;
 /// The shared cross-language capture vectors. Enabled for this crate's own
